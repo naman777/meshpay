@@ -1,12 +1,12 @@
 # MeshPay
 
-**A signed, encrypted payment mesh simulator built with Next.js, TypeScript, and SQLite.**
+**A signed, encrypted payment mesh simulator built with Next.js, TypeScript, and PostgreSQL (with a local SQLite fallback).**
 
 MeshPay demonstrates how encrypted payment instructions can travel through offline relays, reach internet-connected bridges, and settle once in a persistent ledger—even when multiple bridges deliver copies of the same payment.
 
 The dashboard lets you compose payments, advance the mesh one hop at a time, upload packets, and inspect balances, transactions, and network activity.
 
-> This is a local sandbox with demo balances. Bluetooth and device connectivity are simulated inside one server process. No real money moves, and there is no bank or UPI integration. Ed25519 verifies possession of registered sender keys; real-world identity enrollment is outside the demo.
+> This is a sandbox with demo balances. Bluetooth and device connectivity are simulated; hosted instances share their simulator state through PostgreSQL. No real money moves, and there is no bank or UPI integration. Ed25519 verifies possession of registered sender keys; real-world identity enrollment is outside the demo.
 
 ## Contents
 
@@ -44,7 +44,8 @@ The dashboard lets you compose payments, advance the mesh one hop at a time, upl
 - Five simulated devices on a fixed, bidirectional mesh.
 - Manual gossip rounds with packet deduplication and hop limits.
 - Two online bridges delivering packets to settlement.
-- Transactional SQLite balance updates and ledger inserts.
+- Transactional balance updates and ledger inserts in PostgreSQL or local SQLite.
+- PostgreSQL persistence for queues, failures, events, and counters across serverless instances.
 - Persistent duplicate protection using ciphertext hashes and sender nonces.
 - Settled, rejected, duplicate, and invalid delivery outcomes.
 - Responsive dashboard with device inspection, ledger filters, and activity.
@@ -67,21 +68,21 @@ The current dashboard includes sender wallet import and the Failure lab. The led
 
 Versions below reflect `package.json` declarations; `package-lock.json` records resolved versions.
 
-| Layer        | Technology                     | Role                                      |
-| ------------ | ------------------------------ | ----------------------------------------- |
-| Framework    | Next.js 16.4.0, App Router     | Pages and HTTP route handlers             |
-| Interface    | React 19.3.0                   | Client dashboard and interaction state    |
-| Language     | TypeScript ^5.9.3              | Shared contracts and strict type checking |
-| Runtime      | Node.js >=22.13.0              | Server, cryptography, built-in SQLite     |
-| Database     | `node:sqlite` / `DatabaseSync` | Accounts, keys, ledger                    |
-| Cryptography | `node:crypto`                  | Key generation, encryption, hashing       |
-| Validation   | Zod ^4.3.6                     | Request and instruction validation        |
-| Icons        | Lucide React ^0.577.0          | Dashboard iconography                     |
-| Styling      | CSS                            | Responsive layout and mesh visualization  |
-| Testing      | Node test runner via `tsx`     | TypeScript engine and route tests         |
-| Formatting   | Prettier                       | Source formatting                         |
+| Layer        | Technology                               | Role                                      |
+| ------------ | ---------------------------------------- | ----------------------------------------- |
+| Framework    | Next.js 16.4.0, App Router               | Pages and HTTP route handlers             |
+| Interface    | React 19.3.0                             | Client dashboard and interaction state    |
+| Language     | TypeScript ^5.9.3                        | Shared contracts and strict type checking |
+| Runtime      | Node.js >=22.13.0                        | Server, cryptography, built-in SQLite     |
+| Database     | PostgreSQL via `pg`, local `node:sqlite` | Shared hosted state; local fallback       |
+| Cryptography | `node:crypto`                            | Key generation, encryption, hashing       |
+| Validation   | Zod ^4.3.6                               | Request and instruction validation        |
+| Icons        | Lucide React ^0.577.0                    | Dashboard iconography                     |
+| Styling      | CSS                                      | Responsive layout and mesh visualization  |
+| Testing      | Node test runner via `tsx`               | TypeScript engine and route tests         |
+| Formatting   | Prettier                                 | Source formatting                         |
 
-No external database service, ORM, or payment provider is required.
+Local SQLite requires no external database service. Hosted serverless deployments require PostgreSQL; no ORM or payment provider is used.
 
 ## Getting started
 
@@ -146,7 +147,7 @@ There is no dashboard control to reset balances or top up accounts. Seed account
 
 ## Architecture
 
-MeshPay consists of a browser dashboard, Next.js route handlers, an in-process mesh engine, cryptography helpers, and local SQLite storage.
+MeshPay consists of a browser dashboard, Next.js route handlers, a shared mesh simulator, cryptography helpers, and a storage engine selected by `DATABASE_URL`. PostgreSQL supports hosted instances; SQLite supports local use.
 
 ```mermaid
 flowchart TD
@@ -159,7 +160,8 @@ flowchart TD
     Ingest[POST /api/bridge/ingest] --> Engine
     Engine --> Crypto[Node crypto helpers]
     Engine --> Memory[In-memory queues, events, counters]
-    Engine --> DB[(SQLite: accounts, RSA keys, signing public keys, ledger)]
+    Engine --> DB[(PostgreSQL: accounts, keys, ledger, mesh session)]
+    Engine --> Local[(Local fallback: SQLite ledger and in-memory mesh)]
     Wallet[Imported sender wallet] -->|WebCrypto Ed25519 signatures| Browser
     CLI[Trusted local provisioning] --> DB
 ```
@@ -176,9 +178,9 @@ The dashboard uses `/api/actions` and `/api/state`. Public-key and ingestion end
 
 ### Engine layer
 
-`web/server/engine.ts` owns topology, queues, routing, payment validation, logging, database initialization, and settlement.
+`web/server/engine.ts` selects the storage backend. `network.ts` owns topology, routing, failures, and transport snapshots. `postgres-engine.ts` owns shared database transactions and settlement; `sqlite-engine.ts` retains the local engine.
 
-`getEngine()` lazily creates a `MeshEngine` and caches it on `globalThis` for reuse within a server process. Requests in that process share the mesh. This is an in-process singleton, not distributed shared state.
+`getEngine()` lazily caches the selected backend on `globalThis`. PostgreSQL stores the shared mesh in the database; the process cache holds a connection pool. The SQLite fallback holds its mesh in that process’s memory.
 
 ### Cryptography and contracts
 
@@ -186,7 +188,7 @@ The dashboard uses `/api/actions` and `/api/state`. Public-key and ingestion end
 
 ### Storage
 
-SQLite operations are synchronous. Accounts, keys, and ledger entries persist on disk; transport queues and session activity stay in memory.
+SQLite operations are synchronous and transport state stays in memory. PostgreSQL operations are asynchronous: each action locks the singleton `mesh_session` row with `FOR UPDATE`, restores its JSONB snapshot, performs routing or settlement, and commits the updated snapshot alongside balance and ledger changes. This serializes the shared sandbox across replicas. Initialization uses a transaction advisory lock to serialize schema creation, account seeding, and RSA key creation. A small connection pool is reused per server instance.
 
 ## Mesh topology and routing
 
@@ -232,7 +234,7 @@ sequenceDiagram
     participant UI as Dashboard
     participant API as Actions API
     participant Engine as MeshEngine
-    participant DB as SQLite
+    participant DB as Database
     User->>UI: Send ₹500 Alice to Bob
     UI->>UI: Sign instruction and packet commitment
     UI->>API: POST signed authorization and initial hop proof
@@ -373,7 +375,7 @@ For each delivered packet, the engine:
 1. Validates the packet envelope, hashes ciphertext, decrypts the signed authorization, verifies the registered sender signature and packet ID/TTL proof, and validates the instruction.
 2. Rejects timestamps older than 24 hours or more than five minutes ahead.
 3. Rejects identical sender and receiver addresses.
-4. Opens a SQLite `BEGIN IMMEDIATE` transaction.
+4. Opens a database transaction: SQLite uses `BEGIN IMMEDIATE`; PostgreSQL locks the shared mesh row before validation and ledger writes.
 5. Looks up the ciphertext hash or `(sender, nonce)` in the ledger.
 6. Confirms both accounts exist and checks the current sender balance.
 7. Updates balances if funds are sufficient.
@@ -407,7 +409,17 @@ Timestamp validation precedes duplicate lookup: an old, previously settled packe
 
 The total initial balance is ₹9,000. Settlement redistributes it; there is no deposit, withdrawal, or minting feature.
 
-### SQLite tables
+### PostgreSQL storage
+
+The backend uses a dedicated `meshpay` schema by default (`DATABASE_SCHEMA` can select another validated SQL identifier), so its account tables do not collide with other applications. `accounts` stores integer paise balances (BIGINT, converted to JavaScript numbers for the API). `server_keys` stores the shared RSA key pair. `signing_keys` stores registered sender public keys. `ledger` enforces unique ciphertext hashes and `(sender, nonce)` pairs. `mesh_session` holds one versioned JSONB snapshot containing devices, packet queues, sent IDs, delayed deliveries, seeded random state, counters, events, and failure settings. Amounts and balances in this demo remain within JavaScript’s safe integer range.
+
+The entire shared sandbox uses one session row. This favors correctness and simple recovery over throughput. Every instance sees the same demo balances and controls; user authentication and separate per-user workspaces are not implemented. Database administrators can access the RSA key and payment data. Opting out of TLS certificate verification leaves a database impersonation gap; encryption alone does not authenticate the database server. Sender private keys remain in local wallet files and browser memory.
+
+All PostgreSQL state survives process restarts; the dashboard Reset action clears transport state and preserves accounts, keys, and ledger. `npm run db:reset -- --confirm-reset` instead drops the dedicated MeshPay schema and erases that data, after which `npm run wallets:create` seeds fresh balances and registers local wallets. It drops the dedicated MeshPay schema with CASCADE; other schemas and their tables are preserved.
+
+### Local SQLite tables
+
+The persistence table below describes only the local SQLite backend. PostgreSQL also persists all transport state.
 
 `signing_keys(sender PRIMARY KEY, publicKey)` stores one registered Ed25519 public key per account. Sender private keys are never stored in SQLite. Initialization is transactional to serialize first-time setup across processes.
 
@@ -621,11 +633,16 @@ meshpay/
 │   ├── lib/wallet.ts                # Browser wallet import/signing
 │   └── server/
 │       ├── crypto.ts                # Encryption and hashing
-│       └── engine.ts                # Mesh and SQLite settlement
+│       ├── engine.ts                # Runtime backend selection
+│       ├── network.ts               # Routing and serializable transport
+│       ├── postgres-engine.ts       # Shared PostgreSQL state and settlement
+│       ├── postgres-config.ts       # Schema and TLS configuration
+│       └── sqlite-engine.ts         # Local SQLite settlement
 ├── tests/
 │   ├── api.test.ts                  # Origin and validation tests
 │   └── engine.test.ts               # Crypto, routing, persistence
 ├── tests/concurrency.test.ts         # Independent SQLite writers
+├── tests/postgres.test.ts            # Shared state and independent PostgreSQL writers
 ├── tests/helpers/                   # Signing fixtures and process entry
 ├── scripts/create-wallets.ts         # Trusted local provisioning
 ├── screenshots/                     # Dashboard images
@@ -682,7 +699,7 @@ Additional tests cover wrong-key forgery, unsigned legacy rejection, packet ID/T
 
 Two concurrency cases launch **six independent Node processes** against one temporary SQLite file. After readiness, the parent holds a write lock, releases their ingestion barrier, and then releases the lock. Each asserts one settlement, five duplicates sharing one transaction ID, one ledger row, one debit/credit, and conserved balances. Cases cover identical ciphertext and different ciphertexts sharing a sender nonce. These exercise real SQLite writer contention through independent engines rather than one synchronous HTTP server, and are not production load tests.
 
-Browser end-to-end tests, full HTTP integration coverage for every route, and deployment/load tests are not included.
+PostgreSQL integration tests use `POSTGRES_TEST_URL` and create/remove an isolated schema. They exercise restart recovery, shared failure settings, signature rejection, balance conservation, and six independent processes settling identical or re-encrypted deliveries under a held PostgreSQL row lock. They do not reset the main application schema. Run them against a database role allowed to create schemas. Without this variable the PostgreSQL test is explicitly skipped. Browser end-to-end tests and production load tests are not included.
 
 For Next.js changes, follow `AGENTS.md` and consult the version-specific guides in `node_modules/next/dist/docs/`.
 
@@ -696,7 +713,7 @@ For Next.js changes, follow `AGENTS.md` and consult the version-specific guides 
 - RSA-OAEP wraps a fresh AES key for each packet.
 - Schema validation checks amounts, payloads, and UUID nonces.
 - Timestamp bounds limit acceptance of old and far-future instructions.
-- SQLite transactions and constraints prevent duplicate balance application.
+- Database transactions and constraints prevent duplicate balance application.
 - Integer paise avoid floating-point balance arithmetic.
 - Action Origin checks reject the mismatched origins described above.
 
@@ -707,7 +724,7 @@ For Next.js changes, follow `AGENTS.md` and consult the version-specific guides 
 - Bridges are unauthenticated; labels are caller-provided metadata.
 - No physical Bluetooth, peer discovery, mobile wallet, or offline browser application is implemented. The browser still needs access to the server.
 - There is no UPI PIN collection, bank integration, or real-money settlement.
-- The RSA private key is stored unencrypted in SQLite for demo convenience.
+- The RSA private key is stored unencrypted in the selected database for demo convenience.
 - Demo signing keys are unencrypted local wallet fixtures generated on the development machine. Protect them and distribute only to their intended sender.
 - Earlier higher-TTL copies can be replayed; there is no authenticated route history.
 - Queues lack durable storage, automatic expiry, acknowledgements, and capacity limits.
@@ -730,20 +747,23 @@ Failure simulations demonstrate recovery after connectivity heals, not guarantee
 
 ## Deployment considerations
 
-The intended environment is a local sandbox with one server process and persistent writable storage.
+### Vercel with PostgreSQL
 
-| Concern       | Requirement or behavior                                                                                               |
-| ------------- | --------------------------------------------------------------------------------------------------------------------- |
-| Runtime       | Node.js with built-in SQLite; API routes use Node, not Edge                                                           |
-| Filesystem    | Writable `.data/` for the database and sidecar files                                                                  |
-| Persistence   | Preserve SQLite to retain balances, ledger, and keys                                                                  |
-| Restarts      | Pending in-memory packets and session activity are lost                                                               |
-| Replicas      | Each process has independent mesh queues and counters                                                                 |
-| Serverless    | Ephemeral disks and independent instances do not fit the current storage/session model                                |
-| Backups       | Use SQLite-aware backups accounting for WAL; avoid copying only an actively written main database                     |
-| Public access | Add authentication, authorization, request limits, and secure key custody before a deployment involving valuable data |
+1. Create a PostgreSQL database and use its connection URI. Prefer a provider-managed pooled endpoint for serverless hosting, with the provider’s TLS settings. Certificate verification is enabled by default. If a provider CA is unavailable and you explicitly accept unverified TLS, set `DATABASE_TLS_VERIFY=false` locally and in Vercel. Traffic stays encrypted, but server identity is not checked. Supplying `DATABASE_CA_CERT` restores verification even with that flag. Aiven requires its project CA certificate: download it from the service overview and put the PEM content in `DATABASE_CA_CERT` (quoted in `.env`, with `\n` escapes or actual newlines). Add that variable to Vercel Production too. URI SSL options are removed only when supplying this explicit CA, so `pg` cannot overwrite it. See [Aiven’s Node.js connection guide](https://aiven.io/docs/products/postgresql/howto/connect-node).
+2. Set `DATABASE_URL` in a local ignored `.env` file. It is a server secret and must never be named `NEXT_PUBLIC_DATABASE_URL`.
+3. Run `npm run wallets:create` locally against that database. This initializes the schema, seed balances, shared mesh session, and server RSA key, and registers the public keys from your local wallet files. Keep the wallet files in `.data/wallets/` and import them in the dashboard when signing. Existing wallet files are reused; mismatched registered keys are rejected. Do not deploy private wallet files.
+4. Add the same `DATABASE_URL` to Vercel’s project environment variables for Production (and separately for Preview if needed), select Node 24, and redeploy. Local `.env` is ignored by Git and does not configure Vercel. API routes require the Node runtime.
+5. Check `/api/state` and `/api/server-key` for HTTP 200. Import Alice’s matching wallet, run the demo, and check balances and convergence.
 
-Static-only export cannot serve the required APIs and database. No hosted deployment configuration or multi-instance coordination layer is supplied.
+PostgreSQL mode does not create or write a SQLite file. Pending packets and failure settings survive instance changes. The existing local SQLite database is not automatically migrated: PostgreSQL starts with its own seed balances and shared keys. Missing `DATABASE_URL` on Vercel returns a readable 503 configuration error. Database connectivity failures return a sanitized error without credentials.
+
+For a deliberate clean start, run `npm run db:reset -- --confirm-reset`, then `npm run wallets:create`. Stop active traffic during a reset and restart/redeploy running instances afterward so initialization runs again. Resetting removes registered public keys, financial history, and queued payments. Back up data first if it must be retained.
+
+### Local SQLite
+
+Without `DATABASE_URL`, the app uses `.data/meshpay.sqlite` and in-memory transport. This requires writable persistent disk and one mesh process; restarting loses queues. Preserve the database and account for WAL files in backups. `npm run wallets:create -- --data-dir <path>` explicitly uses local SQLite, even when a database URI is configured.
+
+Static export cannot serve the API. PostgreSQL enables serverless persistence, but this remains a public shared demo with simulated balances. Authentication, authorization, request limits, and secure key custody remain gaps for valuable data.
 
 ## Troubleshooting
 
@@ -755,8 +775,8 @@ For signing errors, run `npm run wallets:create`, import the matching wallet JSO
 | SQLite experimental warning                  | Some supported versions mark the API experimental; inspect actual errors if execution fails |
 | Upload leaves balances unchanged             | Run two gossip rounds; inspect ledger rejections                                            |
 | Duplicate count increases on repeated upload | Bridge copies remain queued and are deduplicated again                                      |
-| Reset does not restore seed balances         | Mesh reset preserves SQLite financial state                                                 |
-| Restart loses pending payments               | Queues live in memory                                                                       |
+| Reset does not restore seed balances         | Mesh reset preserves financial state in both backends                                       |
+| Restart loses pending payments               | SQLite queues live in memory; PostgreSQL queues persist                                     |
 | Live demo stops settling                     | Alice may have exhausted her balance                                                        |
 | Timestamp rejection                          | Accepted window is at most 24 hours old or five minutes ahead                               |
 | Database cannot open/write                   | Check directory permissions, writable disk, and working directory                           |
