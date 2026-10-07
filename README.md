@@ -4,12 +4,13 @@
 
 MeshPay demonstrates how encrypted payment instructions can travel through offline relays, reach internet-connected bridges, and settle once in a persistent ledger—even when multiple bridges deliver copies of the same payment.
 
-The dashboard lets you compose payments, advance the mesh one hop at a time, upload packets, and inspect balances, transactions, and network activity.
+The dashboard lets interviewers test instantly, compose payments, advance the mesh one hop at a time, upload packets, and inspect balances, transactions, and network activity.
 
 > This is a sandbox with demo balances. Bluetooth and device connectivity are simulated; hosted instances share their simulator state through PostgreSQL. No real money moves, and there is no bank or UPI integration. Ed25519 verifies possession of registered sender keys; real-world identity enrollment is outside the demo.
 
 ## Contents
 
+- [Instant interview demo](#instant-interview-demo)
 - [Features](#features)
 - [Screenshots](#screenshots)
 - [Technology stack](#technology-stack)
@@ -33,6 +34,14 @@ The dashboard lets you compose payments, advance the mesh one hop at a time, upl
 - [Troubleshooting](#troubleshooting)
 - [Possible next steps](#possible-next-steps)
 
+## Instant interview demo
+
+Open [MeshPay](https://meshpay.namankundra.com/) and click **Run live demo**. No signup, downloads, wallet import, private-key files, or terminal commands are needed. The app prepares four non-extractable Ed25519 signing keys in the browser and sends only their public keys to a new visitor sandbox. The real signature verification, packet encryption, two gossip rounds, settlement, and duplicate detection still run.
+
+Each page load creates a separate sandbox with Alice ₹5,000, Bob ₹1,000, Carol ₹2,500, and Dave ₹500. Visitors cannot change one another’s balances, queues, failure settings, or registered signing keys. **Run live demo** starts fresh before transferring ₹500 Alice → Bob, so repeated interview tests never exhaust Alice’s balance. **Start fresh** restores all seed balances and clears that sandbox’s ledger, packets, counters, and failures. Manual payment and failure controls remain available.
+
+Private signing keys stay in tab memory and are not exportable. Refreshing creates new keys and a fresh sandbox; there is no browser storage of private keys. In PostgreSQL mode, each visitor’s server-side state survives function-instance changes. Sessions expire after one hour of inactivity and expired rows are removed when new sessions are created. Local mode keeps visitor snapshots in memory and loses them on server restart.
+
 ## Features
 
 - Four demo accounts with balances represented as integer paise.
@@ -49,16 +58,17 @@ The dashboard lets you compose payments, advance the mesh one hop at a time, upl
 - Persistent duplicate protection using ciphertext hashes and sender nonces.
 - Settled, rejected, duplicate, and invalid delivery outcomes.
 - Responsive dashboard with device inspection, ledger filters, and activity.
-- One-click demo and mesh reset that preserves financial state.
+- Automatic browser signing, isolated visitor sandboxes, and repeatable one-click demos.
+- Start fresh restores demo balances without changing another visitor’s state.
 - Automated encryption, routing, settlement, validation, and persistence tests.
 
 ## Screenshots
 
-The current dashboard includes sender wallet import and the Failure lab. The ledger reference below shows the original layout.
+The current dashboard prepares signing keys automatically and includes the Failure lab. The ledger reference below shows the original layout.
 
 ### Dashboard
 
-![Signed payment convergence dashboard](screenshots/dashboard-security.jpg)
+![Instant demo with automatic signing and convergence](screenshots/dashboard-instant.jpg)
 
 ### Ledger
 
@@ -98,13 +108,12 @@ Local SQLite requires no external database service. Hosted serverless deployment
 git clone https://github.com/naman777/meshpay.git
 cd meshpay
 npm ci
-npm run wallets:create
 npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000).
 
-No environment variables or external credentials are required. Provisioning registers Ed25519 public keys and writes demo wallets under `.data/wallets/`. Import the relevant JSON wallet in **Sender wallets** before sending; import `alice-demo.json` for the one-click demo. Signing requires WebCrypto Ed25519 on localhost or HTTPS. The engine creates `.data/meshpay.sqlite` when first used.
+No environment variables or wallet provisioning are needed for local visitor demos. Open localhost in a browser supporting WebCrypto Ed25519; automatic setup prepares signing keys and a fresh sandbox. Hosted Vercel deployments need PostgreSQL as described below. The registered-account APIs remain available for development and use optional local administrator provisioning.
 
 ### Production build locally
 
@@ -119,7 +128,7 @@ A production build serves the same signed-payment simulator; it does not add rea
 
 ### Manual flow
 
-1. Import the wallet for your sender and select a different receiver. You can import multiple wallets for the local demo.
+1. Select a sender and a different receiver. All four signing wallets are prepared automatically.
 2. Enter a positive rupee amount with at most two decimal places.
 3. Click **Inject into mesh**. The browser signs the instruction and packet commitment. The server verifies, encrypts, and queues it; balances remain unchanged.
 4. Click **Run gossip round** once. Both relays receive the packet.
@@ -134,14 +143,14 @@ With a fresh database, ₹500 Alice → Bob changes Alice from ₹5,000 to ₹4,
 **Run live demo** performs:
 
 ```text
-Reset mesh → Queue ₹500 Alice → Bob → Gossip → Gossip → Upload
+Fresh demo balances → Sign and queue ₹500 Alice → Bob → Gossip → Gossip → Upload
 ```
 
-The demo requires Alice's imported wallet. Each run creates a new signed payment and nonce. It transfers another ₹500 while Alice has sufficient funds; later runs can produce insufficient-funds rejections. Authorization is verified before reset so invalid demo requests cannot discard queues. There are no prepopulated fake ledger transactions.
+The demo uses Alice’s automatically prepared browser key. Each run restores fresh balances, then creates a new signed payment and nonce. Alice ends at ₹4,500 and Bob at ₹1,500, with one settled ledger entry and one blocked duplicate. Authorization is verified before reset so invalid demo requests cannot discard queues. There are no prepopulated fake ledger transactions.
 
 ### Reset
 
-**Reset mesh** clears queues, delayed deliveries, activity, session counters, and convergence tracking. It restores default failure settings. It preserves accounts, balances, encryption keys, registered signing public keys, ledger entries, and replay protection.
+**Start fresh** clears queues, delayed deliveries, activity, counters, ledger entries, and replay claims in your disposable visitor sandbox. It restores seed balances and default failure settings while keeping the current browser public keys registered. Other visitors and the separate registered-account ledger are unchanged. The developer `/api/actions` reset retains its original behavior of preserving financial state.
 
 There is no dashboard control to reset balances or top up accounts. Seed accounts are inserted only if missing; existing balances survive restart. A fresh database is needed to restore the original seed state.
 
@@ -151,34 +160,35 @@ MeshPay consists of a browser dashboard, Next.js route handlers, a shared mesh s
 
 ```mermaid
 flowchart TD
-    Page[Next.js page and root layout] --> Browser[React dashboard]
-    Browser -->|User actions| Actions[POST /api/actions]
-    Browser -->|Poll every 3 seconds| State[GET /api/state]
-    Actions --> Engine[MeshEngine]
-    State --> Engine
-    Key[GET /api/server-key] --> Engine
-    Ingest[POST /api/bridge/ingest] --> Engine
-    Engine --> Crypto[Node crypto helpers]
-    Engine --> Memory[In-memory queues, events, counters]
-    Engine --> DB[(PostgreSQL: accounts, keys, ledger, mesh session)]
-    Engine --> Local[(Local fallback: SQLite ledger and in-memory mesh)]
-    Wallet[Imported sender wallet] -->|WebCrypto Ed25519 signatures| Browser
-    CLI[Trusted local provisioning] --> DB
+    Page[Next.js page] --> Browser[React dashboard]
+    Wallet[Automatic browser Ed25519 keys] --> Browser
+    Browser -->|Public keys, signed actions, session token| API[POST and GET /api/sandbox]
+    API --> Store[Visitor sandbox store]
+    Store -->|Lock visitor row| Visitors[(PostgreSQL visitor snapshots)]
+    Store --> LocalVisitor[Local in-memory snapshot map]
+    Store --> Engine[In-memory SQLite payment engine]
+    Engine --> Crypto[Signature verification and encryption]
+    Engine --> Network[Gossip, failures, bridge uploads]
+    Developer[Registered-account APIs] --> Legacy[PostgreSQL or local SQLite engine]
+    CLI[Optional trusted provisioning] --> Legacy
+    Legacy --> Ledger[(Registered-account ledger)]
 ```
 
 ### Browser and page layer
 
-`src/app/page.tsx` renders `web/components/dashboard.tsx`, a client component. The root layout supplies metadata and global CSS. The browser imports a sender wallet, generates nonces and hop proofs, signs canonical authorization data, and sends signed actions. It does not own the ledger or perform packet encryption. Imported signing keys remain in browser tab memory and never enter an HTTP request.
+`src/app/page.tsx` renders `web/components/dashboard.tsx`, a client component. The root layout supplies metadata and global CSS. The browser automatically generates non-extractable Ed25519 keys, submits public keys to create a visitor sandbox, generates nonces and hop proofs, signs canonical authorization data, and sends signed actions with its session token. The server owns the ledger and packet encryption. Signing private keys remain in tab memory and never enter an HTTP request.
 
 ### HTTP layer
 
 Handlers under `src/app/api` validate requests and delegate to the engine. All API routes use the Node.js runtime. State and public-key routes are dynamic; state responses also set `Cache-Control: no-store`.
 
-The dashboard uses `/api/actions` and `/api/state`. Public-key and ingestion endpoints provide programmatic access. The built-in bridge upload action calls the engine directly rather than making HTTP requests to `/api/bridge/ingest`.
+The dashboard uses `/api/sandbox` for startup, actions, and polling. The separate registered-account APIs remain `/api/actions` and `/api/state`. Public-key and ingestion endpoints provide programmatic access. The built-in bridge upload action calls the engine directly rather than making HTTP requests to `/api/bridge/ingest`.
 
 ### Engine layer
 
-`web/server/engine.ts` selects the storage backend. `network.ts` owns topology, routing, failures, and transport snapshots. `postgres-engine.ts` owns shared database transactions and settlement; `sqlite-engine.ts` retains the local engine.
+The default dashboard uses `/api/sandbox`. `sandbox-store.ts` stores one versioned JSONB snapshot per visitor in `meshpay.visitor_sandboxes`. Each action locks only that visitor’s row (`FOR UPDATE`), rehydrates an in-memory SQLite engine, executes the existing signed-payment validation and transactional settlement, and saves the updated snapshot before committing. Snapshots include balances, registered public keys, ledger and replay claims, server RSA keys, and transport state. The in-memory SQLite database never writes a file on Vercel. Concurrent instances handling the same visitor serialize on the row lock; separate visitors have independent rows. Local mode uses a process-local snapshot map. Sessions are limited to 1,000 active visitors, with a 1 MB snapshot limit per session.
+
+The original registered-account APIs use the following backend architecture. `web/server/engine.ts` selects the storage backend. `network.ts` owns topology, routing, failures, and transport snapshots. `postgres-engine.ts` owns shared database transactions and settlement; `sqlite-engine.ts` retains the local engine.
 
 `getEngine()` lazily caches the selected backend on `globalThis`. PostgreSQL stores the shared mesh in the database; the process cache holds a connection pool. The SQLite fallback holds its mesh in that process’s memory.
 
@@ -260,7 +270,11 @@ Queueing does not reserve funds. Balance is checked at settlement time. Two inst
 
 ## Sender wallets and signatures
 
-### Trusted registration
+### Automatic visitor registration
+
+`createDemoWallets()` uses WebCrypto to generate four Ed25519 key pairs with non-extractable private keys. The visitor start endpoint registers only the public keys in a brand-new isolated snapshot. A subsequent action cannot change that registry. Browser keys are not downloaded, exported, stored in the database, or sent to the server. This supports public testing of disposable demo accounts, not enrollment for real payment identities.
+
+### Optional trusted registration for developer APIs
 
 ```sh
 npm run wallets:create
@@ -270,7 +284,7 @@ npm run wallets:create -- alice@demo
 
 This local administrator command registers each Ed25519 public key in `signing_keys` and writes an unencrypted **demo wallet fixture** to `.data/wallets/<account>.json`. Distribute each fixture only to its intended sender. The directory is ignored by Git and is not served by any route. Protect filesystem permissions; the requested POSIX mode is not a Windows ACL guarantee.
 
-Provisioning is idempotent and rejects a different key for an already registered sender. If the wallet is missing but its key is registered, restore the original file. There is no automatic rotation/replacement. Independently generated public keys can be registered through the trusted local `registerPublicKey` method. No HTTP enrollment or server-side signing endpoint exists.
+Provisioning is idempotent and rejects a different key for an already registered sender. If the wallet is missing but its key is registered, restore the original file. There is no automatic rotation/replacement. Independently generated public keys can be registered through the trusted local `registerPublicKey` method. The registered-account APIs do not allow HTTP enrollment or key replacement. The visitor start endpoint enrolls only its newly isolated demo. Neither path provides a server-side sender signing endpoint.
 
 The browser checks the public/private pair and registered account key, then keeps a nonextractable signing handle in tab memory. No browser storage is used; reload requires reimport. XSS while a wallet is loaded could still invoke signing. Fixtures are generated on the same development machine as the server; this is not production key custody or identity enrollment.
 
@@ -413,7 +427,7 @@ The total initial balance is ₹9,000. Settlement redistributes it; there is no 
 
 The backend uses a dedicated `meshpay` schema by default (`DATABASE_SCHEMA` can select another validated SQL identifier), so its account tables do not collide with other applications. `accounts` stores integer paise balances (BIGINT, converted to JavaScript numbers for the API). `server_keys` stores the shared RSA key pair. `signing_keys` stores registered sender public keys. `ledger` enforces unique ciphertext hashes and `(sender, nonce)` pairs. `mesh_session` holds one versioned JSONB snapshot containing devices, packet queues, sent IDs, delayed deliveries, seeded random state, counters, events, and failure settings. Amounts and balances in this demo remain within JavaScript’s safe integer range.
 
-The entire shared sandbox uses one session row. This favors correctness and simple recovery over throughput. Every instance sees the same demo balances and controls; user authentication and separate per-user workspaces are not implemented. Database administrators can access the RSA key and payment data. Opting out of TLS certificate verification leaves a database impersonation gap; encryption alone does not authenticate the database server. Sender private keys remain in local wallet files and browser memory.
+The registered-account sandbox uses one session row. This favors correctness and simple recovery over throughput. Every instance sees the same demo balances and controls; real user authentication is not implemented. The default visitor dashboard uses separate snapshot rows instead. Database administrators can access the RSA key and payment data. Opting out of TLS certificate verification leaves a database impersonation gap; encryption alone does not authenticate the database server. Sender private keys remain in local wallet files and browser memory.
 
 All PostgreSQL state survives process restarts; the dashboard Reset action clears transport state and preserves accounts, keys, and ledger. `npm run db:reset -- --confirm-reset` instead drops the dedicated MeshPay schema and erases that data, after which `npm run wallets:create` seeds fresh balances and registers local wallets. It drops the dedicated MeshPay schema with CASCADE; other schemas and their tables are preserved.
 
@@ -458,6 +472,14 @@ Responses are JSON. Send `Content-Type: application/json` for POST requests.
 | `POST` | `/api/actions`       | Simulator control and updated state                  |
 | `POST` | `/api/bridge/ingest` | Deliver one encrypted packet                         |
 | `GET`  | `/api/server-key`    | Public key and encryption algorithm                  |
+
+### Visitor sandbox API
+
+`POST /api/sandbox` with `{ action: "start", publicKeys: { "alice@demo": "<Ed25519 public PEM>", "bob@demo": "<PEM>", "carol@demo": "<PEM>", "dave@demo": "<PEM>" } }` returns HTTP 201 with `{ session, state }`. Unknown fields, private-key payloads, and invalid or non-Ed25519 keys are rejected. A 256-bit random session token grants access to that disposable sandbox; it is held only in tab memory and sent as `X-MeshPay-Session`. Treat it as a capability, not real-world identity authentication.
+
+`GET /api/sandbox` reads that session’s state. `POST /api/sandbox` accepts signed `send`/`demo`, `configure`, `gossip`, `flush`, and `reset` actions using the same signed protocol shown below. The token header is required for every action after startup. Existing signing keys cannot be changed through an action. Invalid or expired tokens return 410; a retry starts a new sandbox. POST requests use the same-origin check and a 32 KB body limit. Responses never include signing private keys or server RSA private keys.
+
+The remaining endpoints below operate on the separate administrator-provisioned registered-account ledger, rather than visitor sessions.
 
 ### GET /api/state
 
@@ -630,13 +652,15 @@ meshpay/
 │   ├── components/dashboard.tsx     # Client interface
 │   ├── lib/types.ts                 # Shared contracts
 │   ├── lib/protocol.ts              # Schemas and canonical signing data
-│   ├── lib/wallet.ts                # Browser wallet import/signing
+│   ├── lib/wallet.ts                # Browser key generation, import, signing
+│   ├── lib/sandbox.ts               # Automatic visitor setup
 │   └── server/
 │       ├── crypto.ts                # Encryption and hashing
 │       ├── engine.ts                # Runtime backend selection
 │       ├── network.ts               # Routing and serializable transport
 │       ├── postgres-engine.ts       # Shared PostgreSQL state and settlement
 │       ├── postgres-config.ts       # Schema and TLS configuration
+│       ├── sandbox-store.ts         # Isolated visitor snapshots and row locks
 │       └── sqlite-engine.ts         # Local SQLite settlement
 ├── tests/
 │   ├── api.test.ts                  # Origin and validation tests
@@ -703,6 +727,8 @@ PostgreSQL integration tests use `POSTGRES_TEST_URL` and create/remove an isolat
 
 For Next.js changes, follow `AGENTS.md` and consult the version-specific guides in `node_modules/next/dist/docs/`.
 
+Visitor regression tests verify non-extractable browser keys, twelve consecutive fresh demo runs, isolated balances, forgery rejection, failure recovery, and reset behavior. PostgreSQL visitor tests create a temporary schema and run six independent processes flushing the same persisted packet queues, asserting one settlement and eleven duplicate bridge deliveries.
+
 ## Security and scope
 
 ### Implemented safeguards
@@ -725,23 +751,23 @@ For Next.js changes, follow `AGENTS.md` and consult the version-specific guides 
 - No physical Bluetooth, peer discovery, mobile wallet, or offline browser application is implemented. The browser still needs access to the server.
 - There is no UPI PIN collection, bank integration, or real-money settlement.
 - The RSA private key is stored unencrypted in the selected database for demo convenience.
-- Demo signing keys are unencrypted local wallet fixtures generated on the development machine. Protect them and distribute only to their intended sender.
+- Default visitor signing keys are generated in browser memory and are non-extractable. Optional registered-account signing keys use local wallet fixtures; protect those files and distribute only to their intended sender.
 - Earlier higher-TTL copies can be replayed; there is no authenticated route history.
-- Queues lack durable storage, automatic expiry, acknowledgements, and capacity limits.
-- Rate limiting, session access control, key rotation/revocation, operational monitoring, and migrations are not implemented.
+- PostgreSQL visitor queues are durable and visitor sessions have expiry and a snapshot-size limit; relay acknowledgements and production delivery guarantees are not implemented.
+- Visitor session tokens isolate disposable sandboxes, but real user authentication, production rate limiting, key rotation/revocation, operational monitoring, and migrations remain gaps.
 
 This is **mesh-routed deferred settlement**. Queueing an instruction is not a guaranteed or final offline funds transfer.
 
 ## Threat model
 
-Trust boundaries: senders hold signing keys; a trusted local administrator registers public keys; relays and bridges are untrusted; the settlement server and database are trusted. The model assumes wallets and trusted components are not compromised.
+Trust boundaries: visitor browsers generate signing keys and register public keys only for their own disposable sandbox. This proves possession of a demo key, not Alice’s real-world identity. Registered-account APIs separately rely on trusted local administrator provisioning; relays and bridges are untrusted; the settlement server and database are trusted. The model assumes wallets and trusted components are not compromised.
 
-| Threat                                             | Mitigation                                                                                         | Remaining gap                                                                                                                                |
-| -------------------------------------------------- | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| Forgery: create/alter a payment for another sender | Domain-separated Ed25519 signatures checked against registered keys before queueing and settlement | Stolen fixtures, XSS while a wallet is imported, or administrator/server compromise defeat this boundary; real identity enrollment is absent |
-| Replay: resend or re-encrypt an instruction        | Persistent ciphertext hash and sender/nonce uniqueness in a transaction; timestamp window          | Signers can authorize new nonces; transport copies and delivery timing remain replayable                                                     |
-| Relay tampering: alter payload, packet ID, or TTL  | AES-GCM, signed instruction/ID/max TTL/root, and current hop proof                                 | Drop packets, consume TTL, or replay an earlier retained higher-TTL copy; no route provenance, and state exposes earlier proofs              |
-| Malicious bridge: forge, duplicate, delay, relabel | Independent signature/metadata checks and durable deduplication                                    | No bridge authentication/provenance; withholding, reordering, false labels, and denial of service remain possible                            |
+| Threat                                             | Mitigation                                                                                         | Remaining gap                                                                                                                                                                 |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Forgery: create/alter a payment for another sender | Domain-separated Ed25519 signatures checked against registered keys before queueing and settlement | Stolen fixtures, XSS in a signing tab, or administrator/server compromise defeat this boundary; real identity enrollment is absent                                            |
+| Replay: resend or re-encrypt an instruction        | Persistent ciphertext hash and sender/nonce uniqueness in a transaction; timestamp window          | Visitor resets intentionally clear disposable replay claims; the registered-account ledger retains them. Signers can authorize new nonces; delivery timing remains replayable |
+| Relay tampering: alter payload, packet ID, or TTL  | AES-GCM, signed instruction/ID/max TTL/root, and current hop proof                                 | Drop packets, consume TTL, or replay an earlier retained higher-TTL copy; no route provenance, and state exposes earlier proofs                                               |
+| Malicious bridge: forge, duplicate, delay, relabel | Independent signature/metadata checks and durable deduplication                                    | No bridge authentication/provenance; withholding, reordering, false labels, and denial of service remain possible                                                             |
 
 Failure simulations demonstrate recovery after connectivity heals, not guaranteed liveness against permanent adversarial dropping or delays past the accepted timestamp window.
 
@@ -751,9 +777,9 @@ Failure simulations demonstrate recovery after connectivity heals, not guarantee
 
 1. Create a PostgreSQL database and use its connection URI. Prefer a provider-managed pooled endpoint for serverless hosting, with the provider’s TLS settings. Certificate verification is enabled by default. If a provider CA is unavailable and you explicitly accept unverified TLS, set `DATABASE_TLS_VERIFY=false` locally and in Vercel. Traffic stays encrypted, but server identity is not checked. Supplying `DATABASE_CA_CERT` restores verification even with that flag. Aiven requires its project CA certificate: download it from the service overview and put the PEM content in `DATABASE_CA_CERT` (quoted in `.env`, with `\n` escapes or actual newlines). Add that variable to Vercel Production too. URI SSL options are removed only when supplying this explicit CA, so `pg` cannot overwrite it. See [Aiven’s Node.js connection guide](https://aiven.io/docs/products/postgresql/howto/connect-node).
 2. Set `DATABASE_URL` in a local ignored `.env` file. It is a server secret and must never be named `NEXT_PUBLIC_DATABASE_URL`.
-3. Run `npm run wallets:create` locally against that database. This initializes the schema, seed balances, shared mesh session, and server RSA key, and registers the public keys from your local wallet files. Keep the wallet files in `.data/wallets/` and import them in the dashboard when signing. Existing wallet files are reused; mismatched registered keys are rejected. Do not deploy private wallet files.
+3. No wallet provisioning is needed for the default dashboard. It automatically creates isolated visitor sessions. Only if testing the separate registered-account APIs, run `npm run wallets:create` locally to initialize their ledger and register fixture public keys. Do not deploy private wallet files.
 4. Add the same `DATABASE_URL` to Vercel’s project environment variables for Production (and separately for Preview if needed), select Node 24, and redeploy. Local `.env` is ignored by Git and does not configure Vercel. API routes require the Node runtime.
-5. Check `/api/state` and `/api/server-key` for HTTP 200. Import Alice’s matching wallet, run the demo, and check balances and convergence.
+5. Open the site in a fresh browser tab and click **Run live demo**. Check one settled payment, one duplicate dropped, and convergence. Open another tab to confirm its balances start fresh.
 
 PostgreSQL mode does not create or write a SQLite file. Pending packets and failure settings survive instance changes. The existing local SQLite database is not automatically migrated: PostgreSQL starts with its own seed balances and shared keys. Missing `DATABASE_URL` on Vercel returns a readable 503 configuration error. Database connectivity failures return a sanitized error without credentials.
 
@@ -761,13 +787,13 @@ For a deliberate clean start, run `npm run db:reset -- --confirm-reset`, then `n
 
 ### Local SQLite
 
-Without `DATABASE_URL`, the app uses `.data/meshpay.sqlite` and in-memory transport. This requires writable persistent disk and one mesh process; restarting loses queues. Preserve the database and account for WAL files in backups. `npm run wallets:create -- --data-dir <path>` explicitly uses local SQLite, even when a database URI is configured.
+Without `DATABASE_URL`, visitor demos use in-memory snapshots. The registered-account APIs use `.data/meshpay.sqlite` and in-memory transport. This requires writable persistent disk and one mesh process; restarting loses queues. Preserve the database and account for WAL files in backups. `npm run wallets:create -- --data-dir <path>` explicitly uses local SQLite, even when a database URI is configured.
 
 Static export cannot serve the API. PostgreSQL enables serverless persistence, but this remains a public shared demo with simulated balances. Authentication, authorization, request limits, and secure key custody remain gaps for valuable data.
 
 ## Troubleshooting
 
-For signing errors, run `npm run wallets:create`, import the matching wallet JSON, and use localhost/HTTPS with WebCrypto Ed25519 support. Restore an original wallet if its key is already registered; automatic replacement is disabled. Existing delayed copies retain their due rounds after network recovery, so continue gossip.
+For visitor setup errors, use localhost/HTTPS in a current browser with WebCrypto Ed25519 support, check database connectivity, and click **Try again**. Visitors never need the provisioning command or wallet files. For developer registered-account signing errors, run `npm run wallets:create` and use the matching wallet JSON through the developer APIs. Restore an original wallet if its key is already registered; automatic replacement is disabled. Existing delayed copies retain their due rounds after network recovery, so continue gossip.
 
 | Symptom                                      | Explanation or next step                                                                    |
 | -------------------------------------------- | ------------------------------------------------------------------------------------------- |
@@ -775,7 +801,7 @@ For signing errors, run `npm run wallets:create`, import the matching wallet JSO
 | SQLite experimental warning                  | Some supported versions mark the API experimental; inspect actual errors if execution fails |
 | Upload leaves balances unchanged             | Run two gossip rounds; inspect ledger rejections                                            |
 | Duplicate count increases on repeated upload | Bridge copies remain queued and are deduplicated again                                      |
-| Reset does not restore seed balances         | Mesh reset preserves financial state in both backends                                       |
+| Reset behavior differs by API                | Visitor Start fresh restores balances; developer mesh reset preserves financial state       |
 | Restart loses pending payments               | SQLite queues live in memory; PostgreSQL queues persist                                     |
 | Live demo stops settling                     | Alice may have exhausted her balance                                                        |
 | Timestamp rejection                          | Accepted window is at most 24 hours old or five minutes ahead                               |
