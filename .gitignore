@@ -1,0 +1,10 @@
+*.log
+.idea/
+.vscode/
+.DS_Store
+node_modules/
+.next/
+.data/
+*.tsbuildinfo
+.env*
+!.env.example
