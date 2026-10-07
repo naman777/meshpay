@@ -22,7 +22,12 @@ import {
   Wallet,
   X,
 } from "lucide-react";
-import type { State } from "../lib/types";
+import type { State, FailureConfig } from "../lib/types";
+import {
+  createSignedSend,
+  importWallet,
+  type BrowserWallet,
+} from "../lib/wallet";
 
 const money = (paise: number) =>
   new Intl.NumberFormat("en-IN", {
@@ -47,6 +52,7 @@ export default function Dashboard() {
   const [selected, setSelected] = useState("alice");
   const [help, setHelp] = useState(false);
   const [section, setSection] = useState("Overview");
+  const [wallets, setWallets] = useState<Record<string, BrowserWallet>>({});
   useEffect(() => {
     if (!help) return;
     const previous = document.activeElement as HTMLElement | null;
@@ -81,6 +87,9 @@ export default function Dashboard() {
       const response = await fetch("/api/state", { cache: "no-store", signal });
       if (!response.ok) throw new Error("Could not connect to the simulator");
       setState(await response.json());
+      setError((previous) =>
+        previous.startsWith("Connection interrupted") ? "" : previous,
+      );
     } catch (e) {
       if (!(e instanceof Error && e.name === "AbortError"))
         setError("Connection interrupted. Retrying automatically…");
@@ -95,17 +104,39 @@ export default function Dashboard() {
       clearInterval(interval);
     };
   }, [refresh]);
-  async function act(action: string) {
+  async function act(action: string, extra: Record<string, unknown> = {}) {
+    if (busy) return;
     setBusy(true);
     setError("");
     try {
+      let payload: Record<string, unknown> = { action, ...extra };
+      if (action === "send" || action === "demo") {
+        const account = action === "demo" ? "alice@demo" : sender;
+        const wallet = wallets[account];
+        if (!wallet)
+          throw new Error(
+            `Import the wallet for ${account} before signing a payment`,
+          );
+        if (
+          state?.accounts.find((a) => a.vpa === account)?.signingPublicKey !==
+          wallet.publicKey
+        )
+          throw new Error(
+            "Wallet key is not registered for this account. Run the local provisioning command and refresh.",
+          );
+        payload = {
+          action,
+          ...(await createSignedSend(
+            wallet,
+            action === "demo" ? "bob@demo" : receiver,
+            action === "demo" ? "500.00" : amount,
+          )),
+        };
+      }
       const response = await fetch("/api/actions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action,
-          ...(action === "send" ? { sender, receiver, amount } : {}),
-        }),
+        body: JSON.stringify(payload),
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error);
@@ -115,6 +146,31 @@ export default function Dashboard() {
     } finally {
       setBusy(false);
     }
+  }
+  async function loadWallets(files: File[]) {
+    setError("");
+    try {
+      const imported: Record<string, BrowserWallet> = {};
+      for (const file of files) {
+        if (file.size > 8192) throw new Error("Wallet file is too large");
+        const wallet = await importWallet(JSON.parse(await file.text()));
+        if (
+          state?.accounts.find((a) => a.vpa === wallet.sender)
+            ?.signingPublicKey !== wallet.publicKey
+        )
+          throw new Error(
+            `Public key for ${wallet.sender} is not registered or does not match this wallet`,
+          );
+        imported[wallet.sender] = wallet;
+      }
+      setWallets((previous) => ({ ...previous, ...imported }));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not import wallet");
+    }
+  }
+  function configure(patch: Partial<FailureConfig>) {
+    if (state)
+      void act("configure", { failures: { ...state.failures, ...patch } });
   }
   function navigate(name: string, id: string) {
     setSection(name);
@@ -263,7 +319,7 @@ export default function Dashboard() {
                 state ? String(state.devices.length).padStart(2, "0") : "—"
               }
               icon={<Smartphone size={19} />}
-              detail="3 offline · 2 bridge nodes"
+              detail={`${state?.devices.filter((d) => d.online).length ?? 2} online bridges · 5 devices`}
               tone="green"
             />
             <Stat
@@ -355,9 +411,11 @@ export default function Dashboard() {
                           x2={d2.x}
                           y2={d2.y}
                           className={
-                            d1.packets.length && d2.packets.length
-                              ? "mesh-edge traveling"
-                              : "mesh-edge"
+                            state?.failures.partitioned && (a >= 3 || b >= 3)
+                              ? "mesh-edge partitioned"
+                              : d1.packets.length && d2.packets.length
+                                ? "mesh-edge traveling"
+                                : "mesh-edge"
                           }
                         />
                       )
@@ -530,6 +588,31 @@ export default function Dashboard() {
                   void act("send");
                 }}
               >
+                <div className="wallet-import">
+                  <label htmlFor="wallet-files">Sender wallets</label>
+                  <input
+                    id="wallet-files"
+                    type="file"
+                    accept=".json,application/json"
+                    multiple
+                    disabled={!state || busy}
+                    onChange={(e) => {
+                      const files = Array.from(e.target.files ?? []);
+                      e.target.value = "";
+                      void loadWallets(files);
+                    }}
+                  />
+                  <p>
+                    Import a demo wallet generated with{" "}
+                    <code>npm run wallets:create</code>. Private keys stay in
+                    this browser tab.
+                  </p>
+                  <span role="status">
+                    {wallets[sender]
+                      ? `Signing ready for ${sender}`
+                      : `No wallet loaded for ${sender}`}
+                  </span>
+                </div>
                 <label htmlFor="sender">From account</label>
                 <div className="select-wrap">
                   <span
@@ -615,8 +698,8 @@ export default function Dashboard() {
                 <div className="encryption-note">
                   <LockKeyhole size={16} />
                   <div>
-                    Encrypted before it leaves
-                    <span>RSA-OAEP + AES-256-GCM</span>
+                    Signed by your wallet
+                    <span>Ed25519 · RSA-OAEP · AES-256-GCM</span>
                   </div>
                   <ShieldCheck size={18} />
                 </div>
@@ -636,6 +719,126 @@ export default function Dashboard() {
               </form>
             </section>
           </div>
+          <section
+            className="panel failure-panel"
+            aria-labelledby="failure-title"
+          >
+            <div className="panel-heading">
+              <div>
+                <h2 id="failure-title">Failure lab</h2>
+                <p>
+                  Disrupt delivery, restore connectivity, and watch the same
+                  signed payment converge.
+                </p>
+              </div>
+              <button
+                className="button light"
+                disabled={busy || !state}
+                onClick={() =>
+                  configure({
+                    lossRate: 0,
+                    delayRounds: 0,
+                    partitioned: false,
+                    offlineBridges: [],
+                  })
+                }
+              >
+                Restore network
+              </button>
+            </div>
+            <div className="failure-controls">
+              <label>
+                Packet loss
+                <select
+                  aria-label="Packet loss"
+                  value={state?.failures.lossRate ?? 0}
+                  disabled={busy || !state}
+                  onChange={(e) =>
+                    configure({ lossRate: Number(e.target.value) })
+                  }
+                >
+                  {[0, 0.25, 0.5, 1].map((rate) => (
+                    <option key={rate} value={rate}>
+                      {rate * 100}%
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Delivery delay
+                <select
+                  aria-label="Delivery delay"
+                  value={state?.failures.delayRounds ?? 0}
+                  disabled={busy || !state}
+                  onChange={(e) =>
+                    configure({ delayRounds: Number(e.target.value) })
+                  }
+                >
+                  {[0, 1, 2, 4].map((rounds) => (
+                    <option key={rounds} value={rounds}>
+                      {rounds} rounds per hop
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="failure-toggle">
+                <input
+                  type="checkbox"
+                  checked={state?.failures.partitioned ?? false}
+                  disabled={busy || !state}
+                  onChange={(e) => configure({ partitioned: e.target.checked })}
+                />
+                Partition bridges from relays
+              </label>
+              {["bridge-1", "bridge-2"].map((id, i) => (
+                <label className="failure-toggle" key={id}>
+                  <input
+                    type="checkbox"
+                    checked={
+                      state?.failures.offlineBridges.includes(id) ?? false
+                    }
+                    disabled={busy || !state}
+                    onChange={(e) =>
+                      configure({
+                        offlineBridges: e.target.checked
+                          ? [...(state?.failures.offlineBridges ?? []), id]
+                          : (state?.failures.offlineBridges ?? []).filter(
+                              (bridge) => bridge !== id,
+                            ),
+                      })
+                    }
+                  />
+                  Bridge {i + 1} internet offline
+                </label>
+              ))}
+            </div>
+            <div className="convergence-strip" role="status" aria-live="polite">
+              <strong>
+                {state?.convergence.converged
+                  ? "Converged: all queued instructions processed"
+                  : state?.convergence.queued
+                    ? "Awaiting convergence"
+                    : "Queue a signed payment to begin"}
+              </strong>
+              <span>
+                {state?.convergence.processed ?? 0}/
+                {state?.convergence.queued ?? 0} processed ·{" "}
+                {state?.convergence.bridgeReached ?? 0} reached bridges ·{" "}
+                {state?.convergence.pending ?? 0} pending
+              </span>
+              <span>
+                {state?.convergence.dropped ?? 0} lost attempts ·{" "}
+                {state?.convergence.delayed ?? 0} delayed copies · seed{" "}
+                {state?.failures.seed ?? 1}
+              </span>
+            </div>
+            <p className="failure-note">
+              Keep running gossip to retry loss or advance delays, then upload.
+              Offline bridges retain packets. Restore network heals partitions;
+              it preserves queued payments. Convergence includes settled and
+              rejected instructions.
+            </p>
+          </section>
           <section className="panel accounts-panel" id="accounts">
             <div className="panel-heading">
               <div>
@@ -849,8 +1052,8 @@ export default function Dashboard() {
               <li>
                 <strong>Compose & encrypt</strong>
                 <span>
-                  Choose demo accounts and an amount. The server simulates a
-                  sender encrypting an instruction.
+                  Import a sender wallet, then choose an amount. Your browser
+                  signs the instruction; the server verifies and encrypts it.
                 </span>
               </li>
               <li>
@@ -871,8 +1074,9 @@ export default function Dashboard() {
             <p className="help-note">
               Reset mesh clears packets and session counters; it keeps balances
               and transactions. Run live demo transfers ₹500 from Alice to Bob
-              each time. Sender authentication and physical Bluetooth are
-              outside this demo.
+              each time using Alice's imported wallet. Ed25519 verifies
+              possession of the registered key; physical Bluetooth and real
+              account enrollment remain outside this demo.
             </p>
             <button className="button dark" onClick={() => setHelp(false)}>
               Let’s explore <ArrowRight size={16} />

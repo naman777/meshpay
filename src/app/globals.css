@@ -8,6 +8,76 @@
   --navy: #183834;
   --green: #38785e;
 }
+.wallet-import {
+  padding: 12px;
+  margin-bottom: 20px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper);
+}
+.wallet-import input {
+  width: 100%;
+  font-size: 11px;
+}
+.wallet-import p {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+.wallet-import span {
+  font-size: 11px;
+  color: var(--green);
+}
+.failure-panel {
+  margin-bottom: 24px;
+}
+.failure-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 18px;
+  padding: 0 24px 20px;
+}
+.failure-controls label {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+}
+.failure-controls select {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+  background: white;
+}
+.failure-toggle input {
+  accent-color: var(--green);
+}
+.convergence-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+  background: var(--paper);
+  margin: 0 24px;
+  padding: 16px;
+  border-radius: 12px;
+  font-size: 12px;
+}
+.convergence-strip strong {
+  color: var(--green);
+}
+.failure-note {
+  padding: 0 24px 18px;
+  line-height: 1.7;
+  color: var(--muted);
+  font-size: 11px;
+}
+.mesh-edge.partitioned {
+  stroke: #c87963;
+  stroke-dasharray: 4 7;
+  opacity: 0.6;
+  animation: none;
+}
 * {
   box-sizing: border-box;
 }
