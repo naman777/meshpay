@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
-import { MeshEngine } from "../web/server/engine";
+import { MeshEngine } from "../web/server/sqlite-engine";
 import { importWallet, createSignedSend } from "../web/lib/wallet";
 
 const run = promisify(execFile);

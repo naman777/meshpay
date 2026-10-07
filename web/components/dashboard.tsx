@@ -85,14 +85,19 @@ export default function Dashboard() {
   const refresh = useCallback(async (signal?: AbortSignal) => {
     try {
       const response = await fetch("/api/state", { cache: "no-store", signal });
-      if (!response.ok) throw new Error("Could not connect to the simulator");
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error || "Could not connect to the simulator");
+      }
       setState(await response.json());
       setError((previous) =>
         previous.startsWith("Connection interrupted") ? "" : previous,
       );
     } catch (e) {
       if (!(e instanceof Error && e.name === "AbortError"))
-        setError("Connection interrupted. Retrying automatically…");
+        setError(
+          `Connection interrupted. ${e instanceof Error ? e.message : "Retrying automatically…"}`,
+        );
     }
   }, []);
   useEffect(() => {

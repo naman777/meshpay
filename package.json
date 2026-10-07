@@ -9,20 +9,24 @@
     "typecheck": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",
     "wallets:create": "tsx scripts/create-wallets.ts",
-    "format": "prettier --write src/app web tests scripts package.json tsconfig.json next.config.ts TYPESCRIPT.md"
+    "format": "prettier --write src/app web tests scripts package.json tsconfig.json next.config.ts TYPESCRIPT.md",
+    "db:reset": "tsx scripts/reset-database.ts"
   },
   "engines": {
     "node": ">=22.13.0"
   },
   "dependencies": {
+    "@next/env": "^16.4.0",
     "lucide-react": "^0.577.0",
     "next": "16.4.0",
+    "pg": "^8.23.1",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@types/pg": "^8.23.1",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "prettier": "^3.9.9",

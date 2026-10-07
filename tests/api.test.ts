@@ -3,13 +3,41 @@ import assert from "node:assert/strict";
 import { POST } from "../src/app/api/actions/route";
 import { POST as ingest } from "../src/app/api/bridge/ingest/route";
 import { GET as state } from "../src/app/api/state/route";
-import { MeshEngine, DEFAULT_FAILURES } from "../web/server/engine";
+import { GET as serverKey } from "../src/app/api/server-key/route";
+import { MeshEngine, DEFAULT_FAILURES } from "../web/server/sqlite-engine";
 import { provision, signedSend } from "./helpers/fixtures";
 import {
   encrypt,
   generateSigningKeys,
   signAuthorization,
 } from "../web/server/crypto";
+
+test("Vercel without a database reports configuration errors instead of opening SQLite", async () => {
+  const shared = globalThis as typeof globalThis & { meshEngine?: MeshEngine };
+  const previousEngine = shared.meshEngine,
+    previousUrl = process.env.DATABASE_URL,
+    previousVercel = process.env.VERCEL;
+  delete shared.meshEngine;
+  delete process.env.DATABASE_URL;
+  process.env.VERCEL = "1";
+  try {
+    for (const response of [
+      await state(),
+      await serverKey(),
+      await POST(request({ action: "gossip" })),
+    ]) {
+      assert.equal(response.status, 503);
+      assert.match((await response.json()).error, /Set DATABASE_URL/);
+    }
+    assert.equal(shared.meshEngine, undefined);
+  } finally {
+    shared.meshEngine = previousEngine;
+    if (previousUrl === undefined) delete process.env.DATABASE_URL;
+    else process.env.DATABASE_URL = previousUrl;
+    if (previousVercel === undefined) delete process.env.VERCEL;
+    else process.env.VERCEL = previousVercel;
+  }
+});
 
 function request(
   body: unknown,

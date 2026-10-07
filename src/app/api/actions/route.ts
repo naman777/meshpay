@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { getEngine } from "@/server/engine";
+import { getEngine, storageFailure } from "@/server/engine";
 import { signedSendSchema, failureSchema } from "@/lib/protocol";
 export const runtime = "nodejs";
 const actionSchema = z.discriminatedUnion("action", [
@@ -34,30 +34,37 @@ export async function POST(request: Request) {
   }
   try {
     const action = actionSchema.parse(await request.json());
-    const engine = getEngine();
+    const engine = await getEngine();
     switch (action.action) {
       case "send": {
-        engine.send({
+        await engine.send({
           authorization: action.authorization,
           hopProof: action.hopProof,
         });
         break;
       }
       case "configure":
-        engine.configureFailures(action.failures);
+        await engine.configureFailures(action.failures);
         break;
       case "gossip":
-        engine.gossip();
+        await engine.gossip();
         break;
       case "flush":
-        engine.flush();
+        await engine.flush();
         break;
       case "reset":
-        engine.resetMesh();
+        await engine.resetMesh();
         break;
       case "demo":
+        if ("demo" in engine) {
+          await engine.demo({
+            authorization: action.authorization,
+            hopProof: action.hopProof,
+          });
+          break;
+        }
         // Verify before resetting so invalid demo requests cannot discard queues.
-        engine.createPacket({
+        await engine.createPacket({
           authorization: action.authorization,
           hopProof: action.hopProof,
         });
@@ -69,18 +76,20 @@ export async function POST(request: Request) {
           throw new Error(
             "Demo requires a signed ₹500 Alice to Bob instruction",
           );
-        engine.resetMesh();
-        engine.send({
+        await engine.resetMesh();
+        await engine.send({
           authorization: action.authorization,
           hopProof: action.hopProof,
         });
-        engine.gossip();
-        engine.gossip();
-        engine.flush();
+        await engine.gossip();
+        await engine.gossip();
+        await engine.flush();
         break;
     }
-    return Response.json(engine.state());
+    return Response.json(await engine.state());
   } catch (error) {
+    const failure = storageFailure(error);
+    if (failure) return failure;
     return Response.json(
       {
         error:

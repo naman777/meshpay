@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
-import { MeshEngine } from "../web/server/engine";
+import { MeshEngine } from "../web/server/sqlite-engine";
 import { provision, signedSend } from "./helpers/fixtures";
 import type { Result } from "../web/lib/types";
 

@@ -1,4 +1,4 @@
-import { MeshEngine } from "../../web/server/engine";
+import { MeshEngine } from "../../web/server/sqlite-engine";
 import type { Packet } from "../../web/lib/types";
 
 const engine = new MeshEngine(process.argv[2]);

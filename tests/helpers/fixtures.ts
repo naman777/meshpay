@@ -4,7 +4,7 @@ import {
   signAuthorization,
   proofRoot,
 } from "../../web/server/crypto";
-import { MeshEngine } from "../../web/server/engine";
+import { MeshEngine } from "../../web/server/sqlite-engine";
 import type {
   Authorization,
   Instruction,

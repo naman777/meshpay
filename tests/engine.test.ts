@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { MeshEngine, DEFAULT_FAILURES } from "../web/server/engine";
+import { MeshEngine, DEFAULT_FAILURES } from "../web/server/sqlite-engine";
 import {
   encrypt,
   decrypt,

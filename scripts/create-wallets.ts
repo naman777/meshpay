@@ -1,7 +1,10 @@
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { createPublicKey } from "node:crypto";
-import { MeshEngine } from "../web/server/engine";
+import { MeshEngine } from "../web/server/sqlite-engine";
+import { PostgresEngine } from "../web/server/postgres-engine";
+import { loadEnvConfig } from "@next/env";
+loadEnvConfig(process.cwd());
 import { generateSigningKeys, normalizeSigningKey } from "../web/server/crypto";
 import type { Wallet } from "../web/lib/types";
 
@@ -15,47 +18,60 @@ if (index !== -1) {
   args.splice(index, 2);
 }
 mkdirSync(join(dataDir, "wallets"), { recursive: true });
-const engine = new MeshEngine(join(dataDir, "meshpay.sqlite"));
-try {
-  const accounts = engine.state().accounts;
-  for (const sender of args.length ? args : accounts.map((a) => a.vpa)) {
-    if (!accounts.some((a) => a.vpa === sender))
-      throw new Error(`Unknown account: ${sender}`);
-    const path = join(
-      dataDir,
-      "wallets",
-      `${sender.replace(/[^a-z0-9-]/gi, "-")}.json`,
-    );
-    let wallet: Wallet;
-    if (existsSync(path)) {
-      wallet = JSON.parse(readFileSync(path, "utf8")) as Wallet;
-      if (
-        wallet.version !== 1 ||
-        wallet.sender !== sender ||
-        normalizeSigningKey(wallet.publicKey) !==
-          createPublicKey(wallet.privateKey)
-            .export({ type: "spki", format: "pem" })
-            .toString()
-      )
-        throw new Error(`Invalid existing wallet: ${path}`);
-    } else {
-      if (accounts.find((a) => a.vpa === sender)?.signingPublicKey)
-        throw new Error(
-          `The public key for ${sender} is already registered but its wallet file is missing. Restore the original wallet; automatic key replacement is disabled.`,
-        );
-      const keys = generateSigningKeys();
-      wallet = { version: 1, sender, ...keys };
-      // Exclusive creation preserves existing wallets. A crash before registration can be retried.
-      writeFileSync(path, JSON.stringify(wallet, null, 2) + "\n", {
-        flag: "wx",
-        mode: 0o600,
-      });
+async function main() {
+  const engine =
+    process.env.DATABASE_URL && index === -1
+      ? new PostgresEngine(process.env.DATABASE_URL)
+      : new MeshEngine(join(dataDir, "meshpay.sqlite"));
+  try {
+    const accounts = (await engine.state()).accounts;
+    for (const sender of args.length ? args : accounts.map((a) => a.vpa)) {
+      if (!accounts.some((a) => a.vpa === sender))
+        throw new Error(`Unknown account: ${sender}`);
+      const path = join(
+        dataDir,
+        "wallets",
+        `${sender.replace(/[^a-z0-9-]/gi, "-")}.json`,
+      );
+      let wallet: Wallet;
+      if (existsSync(path)) {
+        wallet = JSON.parse(readFileSync(path, "utf8")) as Wallet;
+        if (
+          wallet.version !== 1 ||
+          wallet.sender !== sender ||
+          normalizeSigningKey(wallet.publicKey) !==
+            createPublicKey(wallet.privateKey)
+              .export({ type: "spki", format: "pem" })
+              .toString()
+        )
+          throw new Error(`Invalid existing wallet: ${path}`);
+      } else {
+        if (accounts.find((a) => a.vpa === sender)?.signingPublicKey)
+          throw new Error(
+            `The public key for ${sender} is already registered but its wallet file is missing. Restore the original wallet; automatic key replacement is disabled.`,
+          );
+        const keys = generateSigningKeys();
+        wallet = { version: 1, sender, ...keys };
+        // Exclusive creation preserves existing wallets. A crash before registration can be retried.
+        writeFileSync(path, JSON.stringify(wallet, null, 2) + "\n", {
+          flag: "wx",
+          mode: 0o600,
+        });
+      }
+      await engine.registerPublicKey(sender, wallet.publicKey);
+      console.log(
+        `${sender}: public key registered; import ${path} in the dashboard`,
+      );
     }
-    engine.registerPublicKey(sender, wallet.publicKey);
-    console.log(
-      `${sender}: public key registered; import ${path} in the dashboard`,
-    );
+  } finally {
+    await engine.close();
   }
-} finally {
-  engine.close();
 }
+main().catch((error: unknown) => {
+  console.error(
+    error instanceof Error && !("code" in error)
+      ? error.message
+      : "Wallet provisioning failed. Check database connectivity and local wallet files.",
+  );
+  process.exitCode = 1;
+});
