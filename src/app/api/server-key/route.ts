@@ -5,5 +5,7 @@ export async function GET() {
   return Response.json({
     publicKey: getEngine().getPublicKey(),
     algorithm: "RSA-OAEP-SHA256 + AES-256-GCM",
+    signingAlgorithm: "Ed25519",
+    packetVersion: 1,
   });
 }

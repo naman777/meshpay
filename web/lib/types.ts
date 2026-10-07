@@ -4,6 +4,7 @@ export type Account = {
   balance: number;
   initials: string;
   color: string;
+  signingPublicKey?: string | null;
 };
 export type Instruction = {
   sender: string;
@@ -12,7 +13,46 @@ export type Instruction = {
   nonce: string;
   signedAt: number;
 };
-export type Packet = { id: string; ttl: number; ciphertext: string };
+export type Authorization = {
+  version: 1;
+  instruction: Instruction;
+  packetId: string;
+  maxTtl: number;
+  hopRoot: string;
+};
+export type SignedAuthorization = Authorization & { signature: string };
+export type SignedSend = {
+  authorization: SignedAuthorization;
+  hopProof: string;
+};
+export type Packet = {
+  id: string;
+  ttl: number;
+  hopProof: string;
+  ciphertext: string;
+};
+export type Wallet = {
+  version: 1;
+  sender: string;
+  publicKey: string;
+  privateKey: string;
+};
+export type FailureConfig = {
+  lossRate: number;
+  delayRounds: number;
+  partitioned: boolean;
+  offlineBridges: string[];
+  seed: number;
+};
+export type Convergence = {
+  queued: number;
+  processed: number;
+  pending: number;
+  bridgeReached: number;
+  delayed: number;
+  dropped: number;
+  converged: boolean;
+};
 export type Device = {
   id: string;
   name: string;
@@ -52,4 +92,6 @@ export type State = {
   rounds: number;
   duplicates: number;
   transfers: number;
+  failures: FailureConfig;
+  convergence: Convergence;
 };

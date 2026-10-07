@@ -1,19 +1,15 @@
 import { z } from "zod";
 import { getEngine } from "@/server/engine";
+import { signedSendSchema, failureSchema } from "@/lib/protocol";
 export const runtime = "nodejs";
 const actionSchema = z.discriminatedUnion("action", [
-  z.object({
+  z.strictObject({
     action: z.literal("send"),
-    sender: z.string(),
-    receiver: z.string(),
-    amount: z
-      .string()
-      .regex(
-        /^\d{1,6}(\.\d{1,2})?$/,
-        "Enter an amount with at most two decimal places",
-      ),
+    ...signedSendSchema.shape,
   }),
-  z.object({ action: z.enum(["gossip", "flush", "reset", "demo"]) }),
+  z.strictObject({ action: z.literal("demo"), ...signedSendSchema.shape }),
+  z.strictObject({ action: z.literal("configure"), failures: failureSchema }),
+  z.strictObject({ action: z.enum(["gossip", "flush", "reset"]) }),
 ]);
 export async function POST(request: Request) {
   // Simulator controls are same-origin and intentionally local/demo-only.
@@ -41,14 +37,15 @@ export async function POST(request: Request) {
     const engine = getEngine();
     switch (action.action) {
       case "send": {
-        const [whole, fraction = ""] = action.amount.split(".");
-        engine.send(
-          action.sender,
-          action.receiver,
-          Number(whole) * 100 + Number(fraction.padEnd(2, "0")),
-        );
+        engine.send({
+          authorization: action.authorization,
+          hopProof: action.hopProof,
+        });
         break;
       }
+      case "configure":
+        engine.configureFailures(action.failures);
+        break;
       case "gossip":
         engine.gossip();
         break;
@@ -59,8 +56,24 @@ export async function POST(request: Request) {
         engine.resetMesh();
         break;
       case "demo":
+        // Verify before resetting so invalid demo requests cannot discard queues.
+        engine.createPacket({
+          authorization: action.authorization,
+          hopProof: action.hopProof,
+        });
+        if (
+          action.authorization.instruction.sender !== "alice@demo" ||
+          action.authorization.instruction.receiver !== "bob@demo" ||
+          action.authorization.instruction.amount !== 50000
+        )
+          throw new Error(
+            "Demo requires a signed ₹500 Alice to Bob instruction",
+          );
         engine.resetMesh();
-        engine.send("alice@demo", "bob@demo", 50000);
+        engine.send({
+          authorization: action.authorization,
+          hopProof: action.hopProof,
+        });
         engine.gossip();
         engine.gossip();
         engine.flush();

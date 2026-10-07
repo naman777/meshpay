@@ -23,6 +23,7 @@
     "src/app/**/*.ts",
     "src/app/**/*.tsx",
     "tests/**/*.ts",
+    "scripts/**/*.ts",
     ".next/types/**/*.ts",
     ".next/dev/types/**/*.ts"
   ],

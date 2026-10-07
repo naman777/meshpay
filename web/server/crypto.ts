@@ -7,8 +7,54 @@ import {
   publicEncrypt,
   randomBytes,
   constants,
+  createPublicKey,
+  sign,
+  verify,
 } from "node:crypto";
-import type { Instruction } from "../lib/types";
+import type { Authorization, SignedAuthorization } from "../lib/types";
+import { signingText } from "../lib/protocol";
+
+export function generateSigningKeys() {
+  return generateKeyPairSync("ed25519", {
+    publicKeyEncoding: { type: "spki", format: "pem" },
+    privateKeyEncoding: { type: "pkcs8", format: "pem" },
+  });
+}
+export function signAuthorization(
+  auth: Authorization,
+  privateKey: string,
+): SignedAuthorization {
+  return {
+    ...auth,
+    signature: sign(null, Buffer.from(signingText(auth)), privateKey).toString(
+      "base64",
+    ),
+  };
+}
+export function normalizeSigningKey(publicKey: string): string {
+  const key = createPublicKey(publicKey);
+  if (key.asymmetricKeyType !== "ed25519")
+    throw new Error("An Ed25519 public key is required");
+  return key.export({ type: "spki", format: "pem" }).toString();
+}
+export function verifyAuthorization(
+  auth: SignedAuthorization,
+  publicKey: string,
+): boolean {
+  return verify(
+    null,
+    Buffer.from(signingText(auth)),
+    publicKey,
+    Buffer.from(auth.signature, "base64"),
+  );
+}
+export function advanceProof(proof: string): string {
+  return createHash("sha256").update(Buffer.from(proof, "hex")).digest("hex");
+}
+export function proofRoot(proof: string, ttl: number): string {
+  for (let i = 0; i < ttl; i++) proof = advanceProof(proof);
+  return proof;
+}
 
 export function generateKeys() {
   return generateKeyPairSync("rsa", {
@@ -17,12 +63,12 @@ export function generateKeys() {
     privateKeyEncoding: { type: "pkcs8", format: "pem" },
   });
 }
-export function encrypt(instruction: Instruction, publicKey: string): string {
+export function encrypt(payloadValue: unknown, publicKey: string): string {
   const key = randomBytes(32),
     iv = randomBytes(12);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
   const payload = Buffer.concat([
-    cipher.update(JSON.stringify(instruction), "utf8"),
+    cipher.update(JSON.stringify(payloadValue), "utf8"),
     cipher.final(),
   ]);
   const wrapped = publicEncrypt(

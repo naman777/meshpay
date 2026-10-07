@@ -2,12 +2,29 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { z } from "zod";
-import { decrypt, encrypt, generateKeys, hash } from "./crypto";
+import {
+  decrypt,
+  encrypt,
+  generateKeys,
+  hash,
+  advanceProof,
+  proofRoot,
+  normalizeSigningKey,
+  verifyAuthorization,
+} from "./crypto";
+import {
+  authorizationSchema,
+  signedSendSchema,
+  packetSchema,
+  failureSchema,
+  signingText,
+} from "../lib/protocol";
 import type {
   Account,
   Device,
-  Instruction,
+  SignedAuthorization,
+  SignedSend,
+  FailureConfig,
   LedgerEntry,
   MeshEvent,
   Packet,
@@ -15,13 +32,20 @@ import type {
   State,
 } from "../lib/types";
 
-const instructionSchema = z.object({
-  sender: z.string().min(1),
-  receiver: z.string().min(1),
-  amount: z.number().int().positive().max(100_000_000),
-  nonce: z.uuid(),
-  signedAt: z.number().int().nonnegative(),
-});
+export const DEFAULT_FAILURES: FailureConfig = {
+  lossRate: 0,
+  delayRounds: 0,
+  partitioned: false,
+  offlineBridges: [],
+  seed: 1,
+};
+const EDGES = [
+  [0, 1],
+  [0, 2],
+  [1, 3],
+  [2, 4],
+  [1, 2],
+];
 const seeds: Account[] = [
   {
     vpa: "alice@demo",
@@ -60,33 +84,75 @@ export class MeshEngine {
   rounds = 0;
   duplicates = 0;
   transfers = 0;
+  failures: FailureConfig = structuredClone(DEFAULT_FAILURES);
+  private randomState = 1;
+  private dropped = 0;
+  private delayed: { src: number; dst: number; packet: Packet; due: number }[] =
+    [];
+  private sent = new Map<
+    string,
+    { sender: string; nonce: string; authorization: string }
+  >();
   constructor(path: string) {
     this.db = new DatabaseSync(path);
-    this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;
+    this.db.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;");
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec(`
       CREATE TABLE IF NOT EXISTS accounts (vpa TEXT PRIMARY KEY, name TEXT NOT NULL, balance INTEGER NOT NULL CHECK(balance >= 0), initials TEXT NOT NULL, color TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS keys (id INTEGER PRIMARY KEY, publicKey TEXT NOT NULL, privateKey TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS ledger (id TEXT PRIMARY KEY, sender TEXT NOT NULL, receiver TEXT NOT NULL, amount INTEGER NOT NULL, status TEXT NOT NULL, createdAt INTEGER NOT NULL, bridge TEXT NOT NULL, hash TEXT UNIQUE NOT NULL, nonce TEXT NOT NULL, reason TEXT, UNIQUE(sender, nonce));`);
-    const existing = this.db
-      .prepare("SELECT publicKey, privateKey FROM keys WHERE id=1")
-      .get();
-    this.keys = existing ? (existing as typeof this.keys) : generateKeys();
-    if (!existing)
-      this.db
-        .prepare("INSERT INTO keys VALUES (1, ?, ?)")
-        .run(this.keys.publicKey, this.keys.privateKey);
-    const insert = this.db.prepare(
-      "INSERT OR IGNORE INTO accounts VALUES (?, ?, ?, ?, ?)",
-    );
-    seeds.forEach((a) =>
-      insert.run(a.vpa, a.name, a.balance, a.initials, a.color),
-    );
+      CREATE TABLE IF NOT EXISTS ledger (id TEXT PRIMARY KEY, sender TEXT NOT NULL, receiver TEXT NOT NULL, amount INTEGER NOT NULL, status TEXT NOT NULL, createdAt INTEGER NOT NULL, bridge TEXT NOT NULL, hash TEXT UNIQUE NOT NULL, nonce TEXT NOT NULL, reason TEXT, UNIQUE(sender, nonce));
+      CREATE TABLE IF NOT EXISTS signing_keys (sender TEXT PRIMARY KEY, publicKey TEXT NOT NULL);`);
+      const existing = this.db
+        .prepare("SELECT publicKey, privateKey FROM keys WHERE id=1")
+        .get();
+      this.keys = existing ? (existing as typeof this.keys) : generateKeys();
+      if (!existing)
+        this.db
+          .prepare("INSERT INTO keys VALUES (1, ?, ?)")
+          .run(this.keys.publicKey, this.keys.privateKey);
+      const insert = this.db.prepare(
+        "INSERT OR IGNORE INTO accounts VALUES (?, ?, ?, ?, ?)",
+      );
+      seeds.forEach((a) =>
+        insert.run(a.vpa, a.name, a.balance, a.initials, a.color),
+      );
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      this.db.close();
+      throw error;
+    }
     this.resetMesh();
+  }
+  // Trusted local provisioning only. No HTTP route can enroll or replace a key.
+  registerPublicKey(sender: string, publicKey: string) {
+    if (!this.db.prepare("SELECT vpa FROM accounts WHERE vpa=?").get(sender))
+      throw new Error("Unknown account");
+    const normalized = normalizeSigningKey(publicKey);
+    this.db
+      .prepare("INSERT OR IGNORE INTO signing_keys VALUES (?, ?)")
+      .run(sender, normalized);
+    if (
+      this.db
+        .prepare("SELECT publicKey FROM signing_keys WHERE sender=?")
+        .get(sender)?.publicKey !== normalized
+    ) {
+      throw new Error(
+        "Account already has a different registered key; key replacement is not allowed",
+      );
+    }
   }
   log(kind: MeshEvent["kind"], message: string) {
     this.events.unshift({ id: randomUUID(), time: Date.now(), kind, message });
     this.events = this.events.slice(0, 60);
   }
   resetMesh() {
+    this.failures = structuredClone(DEFAULT_FAILURES);
+    this.randomState = this.failures.seed;
+    this.dropped = 0;
+    this.delayed = [];
+    this.sent.clear();
     this.devices = [
       {
         id: "alice",
@@ -141,9 +207,23 @@ export class MeshEngine {
     this.log("system", "Mesh ready. Five devices, two internet bridges.");
   }
   state(): State {
+    let processed = 0;
+    for (const { sender, nonce } of this.sent.values()) {
+      if (
+        this.db
+          .prepare("SELECT id FROM ledger WHERE sender=? AND nonce=?")
+          .get(sender, nonce)
+      )
+        processed++;
+    }
+    const bridgeReached = [...this.sent.keys()].filter((id) =>
+      this.devices.slice(3).some((d) => d.packets.some((p) => p.id === id)),
+    ).length;
     return {
       accounts: this.db
-        .prepare("SELECT * FROM accounts ORDER BY rowid")
+        .prepare(
+          "SELECT a.*, k.publicKey AS signingPublicKey FROM accounts a LEFT JOIN signing_keys k ON k.sender=a.vpa ORDER BY a.rowid",
+        )
         .all() as Account[],
       devices: this.devices,
       transactions: this.db
@@ -155,47 +235,124 @@ export class MeshEngine {
       rounds: this.rounds,
       duplicates: this.duplicates,
       transfers: this.transfers,
+      failures: structuredClone(this.failures),
+      convergence: {
+        queued: this.sent.size,
+        processed,
+        pending: this.sent.size - processed,
+        bridgeReached,
+        delayed: this.delayed.length,
+        dropped: this.dropped,
+        converged: this.sent.size > 0 && processed === this.sent.size,
+      },
     };
   }
-  createPacket(sender: string, receiver: string, amount: number): Packet {
-    const instruction = instructionSchema.parse({
-      sender,
-      receiver,
-      amount,
-      nonce: randomUUID(),
-      signedAt: Date.now(),
-    });
+  private validateAuthorization(
+    auth: SignedAuthorization,
+    packetId: string,
+    ttl: number,
+    hopProof: string,
+  ) {
+    const { sender, receiver, signedAt } = auth.instruction;
+    const registered = this.db
+      .prepare("SELECT publicKey FROM signing_keys WHERE sender=?")
+      .get(sender);
+    if (
+      !registered ||
+      !verifyAuthorization(auth, registered.publicKey as string)
+    )
+      throw new Error("Invalid sender signature or unregistered sender key");
+    if (
+      auth.packetId !== packetId ||
+      ttl > auth.maxTtl ||
+      proofRoot(hopProof, ttl) !== auth.hopRoot
+    )
+      throw new Error(
+        "Packet ID or TTL proof does not match signed authorization",
+      );
+    const age = Date.now() - signedAt;
+    if (age > 86_400_000 || age < -300_000)
+      throw new Error("Payment timestamp outside accepted window");
     if (sender === receiver) throw new Error("Choose a different receiver");
     for (const vpa of [sender, receiver])
       if (!this.db.prepare("SELECT vpa FROM accounts WHERE vpa=?").get(vpa))
         throw new Error("Unknown account");
+  }
+  createPacket(input: SignedSend): Packet {
+    const { authorization: auth, hopProof } = signedSendSchema.parse(input);
+    this.validateAuthorization(auth, auth.packetId, auth.maxTtl, hopProof);
     return {
-      id: randomUUID(),
-      ttl: 5,
-      ciphertext: encrypt(instruction, this.keys.publicKey),
+      id: auth.packetId,
+      ttl: auth.maxTtl,
+      hopProof,
+      ciphertext: encrypt(auth, this.keys.publicKey),
     };
   }
-  send(sender: string, receiver: string, amount: number) {
-    const packet = this.createPacket(sender, receiver, amount);
-    this.devices[0].packets.push(packet);
+  send(input: SignedSend) {
+    const packet = this.createPacket(input);
+    const { sender, receiver, amount, nonce } = input.authorization.instruction;
+    const authorization = signingText(input.authorization);
+    if (
+      this.sent.has(packet.id) &&
+      this.sent.get(packet.id)!.authorization !== authorization
+    )
+      throw new Error(
+        "Packet ID is already queued with a different authorization",
+      );
+    if (!this.devices[0].packets.some((p) => p.id === packet.id))
+      this.devices[0].packets.push(packet);
+    this.sent.set(packet.id, { sender, nonce, authorization });
     this.log(
       "payment",
-      `₹${(amount / 100).toFixed(2)} from ${sender.split("@")[0]} to ${receiver.split("@")[0]} encrypted and queued.`,
+      `₹${(amount / 100).toFixed(2)} from ${sender.split("@")[0]} to ${receiver.split("@")[0]} signature verified, encrypted and queued.`,
     );
     return packet;
   }
+  configureFailures(config: FailureConfig) {
+    const parsed = failureSchema.parse(config);
+    if (parsed.seed !== this.failures.seed) this.randomState = parsed.seed;
+    this.failures = parsed;
+    for (const device of this.devices.slice(3))
+      device.online = !this.failures.offlineBridges.includes(device.id);
+    this.log(
+      "system",
+      `Network configured: ${Math.round(parsed.lossRate * 100)}% loss, ${parsed.delayRounds} rounds delay, partition ${parsed.partitioned ? "on" : "off"}, ${parsed.offlineBridges.length} offline bridges.`,
+    );
+  }
+  private random() {
+    let x = this.randomState;
+    x ^= x << 13;
+    x ^= x >>> 17;
+    x ^= x << 5;
+    this.randomState = x >>> 0;
+    return this.randomState / 0x100000000;
+  }
+  private linkOpen(src: number, dst: number) {
+    return !this.failures.partitioned || (src < 3 && dst < 3);
+  }
   // A sparse topology makes every round an actual hop, instead of a complete graph.
   gossip() {
-    const edges = [
-      [0, 1],
-      [0, 2],
-      [1, 3],
-      [2, 4],
-      [1, 2],
-    ];
     const snapshot = this.devices.map((d) => [...d.packets]);
+    this.rounds++;
     let count = 0;
-    for (const [a, b] of edges)
+    this.delayed = this.delayed.filter((transfer) => {
+      if (
+        transfer.due > this.rounds ||
+        !this.linkOpen(transfer.src, transfer.dst)
+      )
+        return true;
+      if (
+        !this.devices[transfer.dst].packets.some(
+          (p) => p.id === transfer.packet.id,
+        )
+      ) {
+        this.devices[transfer.dst].packets.push(transfer.packet);
+        count++;
+      }
+      return false;
+    });
+    let dropped = 0;
+    for (const [a, b] of EDGES)
       for (const [src, dst] of [
         [a, b],
         [b, a],
@@ -203,42 +360,58 @@ export class MeshEngine {
         for (const packet of snapshot[src]) {
           if (
             packet.ttl <= 0 ||
-            this.devices[dst].packets.some((p) => p.id === packet.id)
+            !this.linkOpen(src, dst) ||
+            this.devices[dst].packets.some((p) => p.id === packet.id) ||
+            this.delayed.some((t) => t.dst === dst && t.packet.id === packet.id)
           )
             continue;
-          this.devices[dst].packets.push({ ...packet, ttl: packet.ttl - 1 });
-          count++;
+          if (this.random() < this.failures.lossRate) {
+            dropped++;
+            continue;
+          }
+          const forwarded = {
+            ...packet,
+            ttl: packet.ttl - 1,
+            hopProof: advanceProof(packet.hopProof),
+          };
+          if (this.failures.delayRounds > 0) {
+            this.delayed.push({
+              src,
+              dst,
+              packet: forwarded,
+              due: this.rounds + this.failures.delayRounds,
+            });
+          } else {
+            this.devices[dst].packets.push(forwarded);
+            count++;
+          }
         }
       }
-    this.rounds++;
+    this.dropped += dropped;
     this.transfers += count;
     this.log(
       "gossip",
-      `Round ${this.rounds}: ${count} packet transfers across nearby devices.`,
+      `Round ${this.rounds}: ${count} transfers, ${dropped} lost attempts, ${this.delayed.length} delayed copies.`,
     );
     return count;
   }
   ingest(packet: Packet, bridge: string): Result {
-    let instruction: Instruction, packetHash: string;
+    let auth: SignedAuthorization, packetHash: string;
     try {
+      packet = packetSchema.parse(packet);
       packetHash = hash(packet.ciphertext);
-      instruction = instructionSchema.parse(
+      auth = authorizationSchema.parse(
         decrypt(packet.ciphertext, this.keys.privateKey),
       );
+      this.validateAuthorization(auth, packet.id, packet.ttl, packet.hopProof);
     } catch {
       return {
         outcome: "INVALID",
-        reason: "Invalid or tampered encrypted payload",
+        reason:
+          "Invalid payload, sender signature, timestamp, or packet metadata",
       };
     }
-    const age = Date.now() - instruction.signedAt;
-    if (age > 86_400_000 || age < -300_000)
-      return {
-        outcome: "INVALID",
-        reason: "Payment timestamp outside accepted window",
-      };
-    if (instruction.sender === instruction.receiver)
-      return { outcome: "INVALID", reason: "Sender and receiver must differ" };
+    const instruction = auth.instruction;
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const previous = this.db
@@ -306,13 +479,13 @@ export class MeshEngine {
   }
   flush() {
     const results: Result[] = [];
-    for (const device of this.devices.filter((d) => d.online))
+    for (const device of this.devices.slice(3).filter((d) => d.online))
       for (const packet of device.packets)
         results.push(this.ingest(packet, device.name));
     if (!results.length)
       this.log(
         "system",
-        "No packets at the bridges yet. Run another gossip round.",
+        "No packets at an online bridge. Advance gossip or restore bridge connectivity.",
       );
     return results;
   }

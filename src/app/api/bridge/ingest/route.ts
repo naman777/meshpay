@@ -1,15 +1,9 @@
-import { z } from "zod";
+import { packetSchema } from "@/lib/protocol";
 import { getEngine } from "@/server/engine";
 export const runtime = "nodejs";
 export async function POST(request: Request) {
   try {
-    const packet = z
-      .object({
-        id: z.uuid(),
-        ttl: z.number().int().min(0).max(5),
-        ciphertext: z.string().max(16_384),
-      })
-      .parse(await request.json());
+    const packet = packetSchema.parse(await request.json());
     const result = getEngine().ingest(
       packet,
       (request.headers.get("X-Bridge-Node-Id") || "external-bridge").slice(
