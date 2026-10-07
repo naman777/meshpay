@@ -1,12 +1,12 @@
 # MeshPay
 
-**An interactive payment mesh simulator built with Next.js, TypeScript, and SQLite.**
+**A signed, encrypted payment mesh simulator built with Next.js, TypeScript, and SQLite.**
 
 MeshPay demonstrates how encrypted payment instructions can travel through offline relays, reach internet-connected bridges, and settle once in a persistent ledger—even when multiple bridges deliver copies of the same payment.
 
 The dashboard lets you compose payments, advance the mesh one hop at a time, upload packets, and inspect balances, transactions, and network activity.
 
-> This is a local sandbox with demo balances. Bluetooth and device connectivity are simulated inside one server process. No real money moves, and there is no bank or UPI integration. Encryption is implemented; sender authentication is outside the current scope.
+> This is a local sandbox with demo balances. Bluetooth and device connectivity are simulated inside one server process. No real money moves, and there is no bank or UPI integration. Ed25519 verifies possession of registered sender keys; real-world identity enrollment is outside the demo.
 
 ## Contents
 
@@ -19,6 +19,8 @@ The dashboard lets you compose payments, advance the mesh one hop at a time, upl
 - [Mesh topology and routing](#mesh-topology-and-routing)
 - [Payment lifecycle](#payment-lifecycle)
 - [Encryption and packet format](#encryption-and-packet-format)
+- [Sender wallets and signatures](#sender-wallets-and-signatures)
+- [Failure simulation and convergence](#failure-simulation-and-convergence)
 - [Settlement and duplicate protection](#settlement-and-duplicate-protection)
 - [Data model and persistence](#data-model-and-persistence)
 - [API reference](#api-reference)
@@ -26,6 +28,7 @@ The dashboard lets you compose payments, advance the mesh one hop at a time, upl
 - [Repository structure](#repository-structure)
 - [Development and testing](#development-and-testing)
 - [Security and scope](#security-and-scope)
+- [Threat model](#threat-model)
 - [Deployment considerations](#deployment-considerations)
 - [Troubleshooting](#troubleshooting)
 - [Possible next steps](#possible-next-steps)
@@ -35,6 +38,9 @@ The dashboard lets you compose payments, advance the mesh one hop at a time, upl
 - Four demo accounts with balances represented as integer paise.
 - Payment composition with account and amount validation.
 - Hybrid RSA-OAEP-SHA256 and AES-256-GCM encryption.
+- Per-user Ed25519 signatures checked against registered public keys before queueing and settlement.
+- Signed packet identity and a hash-chain proof for decrementable TTL.
+- Seeded packet loss, bridge outages, partitions, delayed delivery, and convergence metrics.
 - Five simulated devices on a fixed, bidirectional mesh.
 - Manual gossip rounds with packet deduplication and hop limits.
 - Two online bridges delivering packets to settlement.
@@ -47,9 +53,11 @@ The dashboard lets you compose payments, advance the mesh one hop at a time, upl
 
 ## Screenshots
 
+The current dashboard includes sender wallet import and the Failure lab. The ledger reference below shows the original layout.
+
 ### Dashboard
 
-![MeshPay desktop dashboard](screenshots/dashboard-desktop.jpg)
+![Signed payment convergence dashboard](screenshots/dashboard-security.jpg)
 
 ### Ledger
 
@@ -89,12 +97,13 @@ No external database service, ORM, or payment provider is required.
 git clone https://github.com/naman777/meshpay.git
 cd meshpay
 npm ci
+npm run wallets:create
 npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000).
 
-No environment variables or external credentials are required. The engine creates `.data/meshpay.sqlite` when first used.
+No environment variables or external credentials are required. Provisioning registers Ed25519 public keys and writes demo wallets under `.data/wallets/`. Import the relevant JSON wallet in **Sender wallets** before sending; import `alice-demo.json` for the one-click demo. Signing requires WebCrypto Ed25519 on localhost or HTTPS. The engine creates `.data/meshpay.sqlite` when first used.
 
 ### Production build locally
 
@@ -103,15 +112,15 @@ npm run build
 npm start
 ```
 
-A production build serves the same simulator; it does not add authentication or real payment processing.
+A production build serves the same signed-payment simulator; it does not add real-world identity enrollment, authenticated transport sessions, or bank settlement.
 
 ## Using the simulator
 
 ### Manual flow
 
-1. Select different sender and receiver accounts.
+1. Import the wallet for your sender and select a different receiver. You can import multiple wallets for the local demo.
 2. Enter a positive rupee amount with at most two decimal places.
-3. Click **Inject into mesh**. An encrypted packet enters the sender queue; balances remain unchanged.
+3. Click **Inject into mesh**. The browser signs the instruction and packet commitment. The server verifies, encrypts, and queues it; balances remain unchanged.
 4. Click **Run gossip round** once. Both relays receive the packet.
 5. Run a second round. Both internet bridges receive copies.
 6. Click **Upload via bridges**. The first valid delivery settles; the second is dropped as a duplicate.
@@ -127,11 +136,11 @@ With a fresh database, ₹500 Alice → Bob changes Alice from ₹5,000 to ₹4,
 Reset mesh → Queue ₹500 Alice → Bob → Gossip → Gossip → Upload
 ```
 
-Each run creates a new payment and nonce. It transfers another ₹500 while Alice has sufficient funds; later runs can produce insufficient-funds rejections. There are no prepopulated fake ledger transactions.
+The demo requires Alice's imported wallet. Each run creates a new signed payment and nonce. It transfers another ₹500 while Alice has sufficient funds; later runs can produce insufficient-funds rejections. Authorization is verified before reset so invalid demo requests cannot discard queues. There are no prepopulated fake ledger transactions.
 
 ### Reset
 
-**Reset mesh** clears device queues, activity, gossip rounds, transfer counts, and the session duplicate counter. It preserves accounts, balances, keys, ledger entries, and persistent duplicate claims.
+**Reset mesh** clears queues, delayed deliveries, activity, session counters, and convergence tracking. It restores default failure settings. It preserves accounts, balances, encryption keys, registered signing public keys, ledger entries, and replay protection.
 
 There is no dashboard control to reset balances or top up accounts. Seed accounts are inserted only if missing; existing balances survive restart. A fresh database is needed to restore the original seed state.
 
@@ -150,12 +159,14 @@ flowchart TD
     Ingest[POST /api/bridge/ingest] --> Engine
     Engine --> Crypto[Node crypto helpers]
     Engine --> Memory[In-memory queues, events, counters]
-    Engine --> DB[(SQLite: accounts, keys, ledger)]
+    Engine --> DB[(SQLite: accounts, RSA keys, signing public keys, ledger)]
+    Wallet[Imported sender wallet] -->|WebCrypto Ed25519 signatures| Browser
+    CLI[Trusted local provisioning] --> DB
 ```
 
 ### Browser and page layer
 
-`src/app/page.tsx` renders `web/components/dashboard.tsx`, a client component. The root layout supplies metadata and global CSS. The browser reads state and sends JSON actions; it does not own the ledger or perform packet encryption.
+`src/app/page.tsx` renders `web/components/dashboard.tsx`, a client component. The root layout supplies metadata and global CSS. The browser imports a sender wallet, generates nonces and hop proofs, signs canonical authorization data, and sends signed actions. It does not own the ledger or perform packet encryption. Imported signing keys remain in browser tab memory and never enter an HTTP request.
 
 ### HTTP layer
 
@@ -171,7 +182,7 @@ The dashboard uses `/api/actions` and `/api/state`. Public-key and ingestion end
 
 ### Cryptography and contracts
 
-`web/server/crypto.ts` implements RSA key generation, AES encryption/decryption, envelope decoding, and ciphertext hashing. `web/lib/types.ts` defines shared account, instruction, packet, device, ledger, event, result, and state contracts.
+`web/server/crypto.ts` implements RSA/Ed25519 key generation, signature verification, AES encryption/decryption, hash-chain proofs, and ciphertext hashing. `web/lib/protocol.ts` defines strict schemas and canonical signing data; `web/lib/wallet.ts` handles browser wallet import/signing. `web/lib/types.ts` defines the shared contracts.
 
 ### Storage
 
@@ -204,9 +215,9 @@ The sender device ID remains `alice` regardless of the account selected in the f
 - Packets present at the start can move one edge in either direction.
 - Newly received packets can be forwarded only in the next round.
 - Receivers skip packet IDs they already hold.
-- New packets start with `ttl: 5`; forwarded copies decrement TTL by one.
+- New packets start with `ttl: 5`; forwarded copies decrement TTL by one and hash the hop proof once.
 - TTL-zero copies remain stored but cannot be forwarded further.
-- Source devices retain copies; there is no automatic eviction.
+- Source devices retain copies, allowing retries after loss; there is no automatic eviction.
 - Routing advances manually, with no Bluetooth discovery or background transport.
 
 Two rounds reach both bridges in this topology. Each round increments `rounds`; successful copies increment `transfers`.
@@ -223,9 +234,10 @@ sequenceDiagram
     participant Engine as MeshEngine
     participant DB as SQLite
     User->>UI: Send ₹500 Alice to Bob
-    UI->>API: POST send, amount "500.00"
-    API->>Engine: send(alice, bob, 50000)
-    Engine->>Engine: Validate, encrypt, queue packet
+    UI->>UI: Sign instruction and packet commitment
+    UI->>API: POST signed authorization and initial hop proof
+    API->>Engine: send(signed authorization, hop proof)
+    Engine->>Engine: Verify registered key, validate, encrypt, queue
     API-->>UI: Updated state; balances unchanged
     User->>UI: Run two gossip rounds
     UI->>API: POST gossip twice
@@ -233,7 +245,7 @@ sequenceDiagram
     User->>UI: Upload via bridges
     UI->>API: POST flush
     API->>Engine: flush()
-    Engine->>Engine: Decrypt and validate first delivery
+    Engine->>Engine: Decrypt, verify signature, check packet ID and TTL proof
     Engine->>DB: Begin transaction; check duplicates
     Engine->>DB: Update balances and insert ledger row
     Engine->>DB: Commit
@@ -244,7 +256,38 @@ sequenceDiagram
 
 Queueing does not reserve funds. Balance is checked at settlement time. Two instructions may both enter the mesh, while only the first settles if there are insufficient funds for both.
 
+## Sender wallets and signatures
+
+### Trusted registration
+
+```sh
+npm run wallets:create
+# Or provision one account:
+npm run wallets:create -- alice@demo
+```
+
+This local administrator command registers each Ed25519 public key in `signing_keys` and writes an unencrypted **demo wallet fixture** to `.data/wallets/<account>.json`. Distribute each fixture only to its intended sender. The directory is ignored by Git and is not served by any route. Protect filesystem permissions; the requested POSIX mode is not a Windows ACL guarantee.
+
+Provisioning is idempotent and rejects a different key for an already registered sender. If the wallet is missing but its key is registered, restore the original file. There is no automatic rotation/replacement. Independently generated public keys can be registered through the trusted local `registerPublicKey` method. No HTTP enrollment or server-side signing endpoint exists.
+
+The browser checks the public/private pair and registered account key, then keeps a nonextractable signing handle in tab memory. No browser storage is used; reload requires reimport. XSS while a wallet is loaded could still invoke signing. Fixtures are generated on the same development machine as the server; this is not production key custody or identity enrollment.
+
+### Canonical signed representation
+
+Ed25519 signs the UTF-8 bytes of this fixed-order JSON array:
+
+```text
+["meshpay:payment:v1", version, packetId, maxTtl, hopRoot,
+ sender, receiver, amount, nonce, signedAt]
+```
+
+The domain and version prevent cross-protocol reuse; explicit order avoids JSON object-order ambiguity. Signatures are Base64-encoded 64-byte Ed25519 signatures. Strict schemas reject unsupported versions and extra fields. Verification occurs before queueing and at every ingestion against the registered sender key.
+
+Existing balances and ledger data are preserved; the signing registry is an additive table. Provision keys before new payments. Unsigned legacy requests and encrypted instructions are rejected.
+
 ## Encryption and packet format
+
+The plaintext instruction below is nested inside a signed authorization object with `version: 1`, `packetId`, `maxTtl`, `hopRoot`, and `signature`. The entire signed authorization is encrypted, not just the instruction.
 
 ### Plaintext instruction
 
@@ -260,12 +303,12 @@ Amounts inside the engine are integer paise; timestamps are Unix epoch milliseco
 }
 ```
 
-The timestamp illustrates the shape; new packets use current server time. `signedAt` is a timestamp field, not a digital signature.
+The timestamp illustrates the shape; new instructions use current browser time. `signedAt` is covered by the instruction signature, not a separate signature over only the timestamp.
 
 ### Encryption
 
 1. Generate a fresh 32-byte AES key and 12-byte IV.
-2. Encrypt the JSON instruction with AES-256-GCM.
+2. Encrypt the signed authorization JSON with AES-256-GCM.
 3. Wrap the AES key using the server RSA-2048 public key, OAEP padding, and SHA-256.
 4. Concatenate the wrapped key, IV, encrypted JSON, and 16-byte GCM tag.
 5. Encode the envelope as Base64.
@@ -281,21 +324,53 @@ RSA-wrapped AES key | IV       | Encrypted JSON | GCM tag
 {
   "id": "7b59a7f6-7ccf-4dc4-a5c4-88f41a3e50dd",
   "ttl": 5,
+  "hopProof": "<64 lowercase hex characters>",
   "ciphertext": "<Base64 encrypted packet>"
 }
 ```
 
-Packet ID and TTL are outside the encrypted payload. Relays copy opaque ciphertext without decrypting it. SHA-256 hashing uses decoded ciphertext bytes, not the Base64 text.
+The outer ID must match the signed packet ID. The sender generates a random 32-byte initial proof and signs `hopRoot = SHA256^maxTtl(initialProof)`. Each relay decrements TTL and hashes the proof once. Ingestion requires:
+
+```text
+0 <= ttl <= signed maxTtl <= 5
+SHA256^ttl(hopProof) == signed hopRoot
+outer id == signed packetId
+```
+
+Changing TTL without its matching proof fails. A relay holding only its current proof cannot compute the preimage required to increase TTL. It can consume more hops by hashing further or drop the packet.
+
+**Limit:** a malicious node retaining an earlier higher-TTL copy can replay it. The sandbox state API exposes queue copies, including earlier proofs. This is not proof of a real route or a globally monotonic hop counter. Persistent sender/nonce deduplication still prevents repeat fund movement.
+
+Relays copy opaque ciphertext without decrypting. SHA-256 duplicate hashing uses decoded ciphertext bytes, not Base64 text.
 
 Decoding rejects strings longer than 16,384 characters, characters outside the accepted Base64 pattern, and envelopes shorter than 284 bytes. Decryption verifies the GCM tag and parses JSON.
 
-The server simulates sender encryption. Cryptography provides payload confidentiality and integrity within this simulated transport, but does not establish sender authorization.
+The browser signs using the sender wallet; the server verifies and encrypts. Public RSA-key knowledge alone cannot forge a registered sender signature.
+
+## Failure simulation and convergence
+
+The **Failure lab** changes conditions without recreating queued payments.
+
+| Failure        | Behavior                                                    | Recovery                    |
+| -------------- | ----------------------------------------------------------- | --------------------------- |
+| Packet loss    | Seeded probability per attempted link copy; source retained | Later gossip rounds retry   |
+| Offline bridge | Internet upload disabled; mesh reception retained           | Restore internet and upload |
+| Partition      | Relay/bridge links blocked in both directions               | Heal links and gossip       |
+| Delay          | Successful copies scheduled for a future round              | Advance rounds until due    |
+
+API ranges are loss 0–1, delay 0–10 rounds, and a positive 32-bit seed. UI presets cover common cases. Xorshift provides reproducible loss simulation and is not used for cryptography. Changing the seed restarts its sequence. Delayed copies wait if partitioned at their due round; existing schedules retain their due rounds when connectivity is restored.
+
+To show recovery, import a wallet, set loss to 100% or partition the bridges, queue a payment, and run gossip. It remains pending. Click **Restore network**, run gossip until a bridge receives it, then upload. Processed becomes 1/1 and converges. Repeated upload does not change the ledger. For outages, take both bridges offline, gossip twice, restore one, and upload its retained copy. For delays, continue advancing gossip rounds.
+
+Metrics include `queued`, `processed`, `pending`, `bridgeReached`, `delayed`, `dropped`, and `converged`. Converged means all packet IDs queued in this session have terminal ledger outcomes, including rejections. It does not mean every device has a copy or all payments settled successfully. External ingestion does not enter session queue tracking.
+
+Recovery requires a valid instruction, an available route within TTL, an online bridge, and delivery inside the timestamp window. Permanent partitions, 100% loss, expired packets, and permanent outages have no convergence guarantee.
 
 ## Settlement and duplicate protection
 
 For each delivered packet, the engine:
 
-1. Hashes decoded ciphertext, decrypts it, and validates the instruction schema.
+1. Validates the packet envelope, hashes ciphertext, decrypts the signed authorization, verifies the registered sender signature and packet ID/TTL proof, and validates the instruction.
 2. Rejects timestamps older than 24 hours or more than five minutes ahead.
 3. Rejects identical sender and receiver addresses.
 4. Opens a SQLite `BEGIN IMMEDIATE` transaction.
@@ -334,6 +409,8 @@ The total initial balance is ₹9,000. Settlement redistributes it; there is no 
 
 ### SQLite tables
 
+`signing_keys(sender PRIMARY KEY, publicKey)` stores one registered Ed25519 public key per account. Sender private keys are never stored in SQLite. Initialization is transactional to serialize first-time setup across processes.
+
 | Table      | Columns                                                                                          | Constraints and purpose                                   |
 | ---------- | ------------------------------------------------------------------------------------------------ | --------------------------------------------------------- |
 | `accounts` | `vpa`, `name`, `balance`, `initials`, `color`                                                    | Primary `vpa`; nonnegative balance                        |
@@ -343,6 +420,8 @@ The total initial balance is ₹9,000. Settlement redistributes it; there is no 
 Initialization uses `CREATE TABLE IF NOT EXISTS` and seeds missing accounts using `INSERT OR IGNORE`. There is no versioned migration system.
 
 ### Storage lifetime
+
+Registered signing public keys survive reset and restart. Demo private keys live in local wallet files; imported browser handles last until reload. Failure settings, delayed transfers, and convergence tracking are in memory and reset with the mesh.
 
 | State                                | Storage | Survives mesh reset | Survives server restart |
 | ------------------------------------ | ------- | ------------------- | ----------------------- |
@@ -370,6 +449,8 @@ Responses are JSON. Send `Content-Type: application/json` for POST requests.
 
 ### GET /api/state
 
+Accounts include `signingPublicKey` (PEM or null). State includes `failures` (`lossRate`, `delayRounds`, `partitioned`, `offlineBridges`, `seed`) and `convergence` (`queued`, `processed`, `pending`, `bridgeReached`, `delayed`, `dropped`, `converged`). No private keys are returned.
+
 | Field          | Type            | Meaning                                        |
 | -------------- | --------------- | ---------------------------------------------- |
 | `accounts`     | `Account[]`     | Identity, paise balance, display attributes    |
@@ -389,21 +470,52 @@ This unauthenticated endpoint exposes account data and device ciphertext. Ledger
 ```json
 {
   "action": "send",
-  "sender": "alice@demo",
-  "receiver": "bob@demo",
-  "amount": "500.00"
+  "authorization": {
+    "version": 1,
+    "packetId": "7b59a7f6-7ccf-4dc4-a5c4-88f41a3e50dd",
+    "maxTtl": 5,
+    "hopRoot": "<64 lowercase hex characters>",
+    "instruction": {
+      "sender": "alice@demo",
+      "receiver": "bob@demo",
+      "amount": 50000,
+      "nonce": "a7e036e4-41bb-4c06-a4b1-bf98351b92db",
+      "signedAt": 1791331200000
+    },
+    "signature": "<Base64 Ed25519 signature>"
+  },
+  "hopProof": "<initial 64-character hex proof>"
 }
 ```
 
-The amount is a **rupee decimal string**, not a number or paise value. The route splits whole and fractional parts to obtain integer paise without floating-point currency multiplication.
+This illustrates the signed shape; placeholders are not accepted. Generate real values with a browser wallet or the canonical protocol. The API accepts integer paise inside the signed instruction. The dashboard accepts a rupee string and converts to paise before signing without floating-point currency multiplication.
 
-- Syntax: one to six whole digits, optionally followed by one or two decimal digits.
+**Breaking change:** unsigned `{ action, sender, receiver, amount }` requests are rejected. There is no server-signing fallback.
+
+- Dashboard syntax: one to six whole digits, optionally followed by one or two decimal digits.
 - Accepted examples: `"100"`, `"100.5"`, `"100.50"`.
 - Rejected examples: numeric `100`, `"0.001"`, `"-10"`, `"1e3"`, `"1,000"`.
 - Converted amounts must be positive; accounts must exist and differ.
-- The engine maximum is 100,000,000 paise (₹10,00,000); action syntax limits this endpoint to ₹9,99,999.99.
+- The signed instruction maximum is 100,000,000 paise (₹10,00,000); dashboard syntax limits its input to ₹9,99,999.99.
 
 #### Controls
+
+`demo` requires the same signed request fields as `send`, specifically ₹500 Alice → Bob, and verifies before reset. `configure` accepts full failure settings without clearing queues:
+
+```json
+{
+  "action": "configure",
+  "failures": {
+    "lossRate": 0.5,
+    "delayRounds": 2,
+    "partitioned": false,
+    "offlineBridges": ["bridge-2"],
+    "seed": 12345
+  }
+}
+```
+
+Restore network with loss/delay zero, partition false, and no offline bridges. Retaining the seed preserves its current sequence. Simulator controls remain unauthenticated.
 
 ```json
 { "action": "gossip" }
@@ -422,15 +534,9 @@ Validation and action failures return HTTP `400` with `{ "error": "..." }`. When
 
 #### PowerShell example
 
-```powershell
-$body = @{
-    action = 'send'
-    sender = 'alice@demo'
-    receiver = 'bob@demo'
-    amount = '500.00'
-} | ConvertTo-Json
+Queue a signed payment through the dashboard first, then advance delivery:
 
-Invoke-RestMethod -Uri 'http://localhost:3000/api/actions' -Method Post -ContentType 'application/json' -Body $body
+```powershell
 Invoke-RestMethod -Uri 'http://localhost:3000/api/actions' -Method Post -ContentType 'application/json' -Body '{"action":"gossip"}'
 Invoke-RestMethod -Uri 'http://localhost:3000/api/actions' -Method Post -ContentType 'application/json' -Body '{"action":"gossip"}'
 Invoke-RestMethod -Uri 'http://localhost:3000/api/actions' -Method Post -ContentType 'application/json' -Body '{"action":"flush"}'
@@ -439,6 +545,8 @@ Invoke-RestMethod -Uri 'http://localhost:3000/api/actions' -Method Post -Content
 This example changes demo balances when settlement succeeds.
 
 ### POST /api/bridge/ingest
+
+Required `hopProof` is 64 lowercase hex characters. Ingestion independently verifies signatures and metadata; encrypting an unsigned instruction with the RSA public key cannot bypass authorization.
 
 Accepts the transport packet shape shown earlier. The ciphertext placeholder must be replaced with an actual encrypted instruction.
 
@@ -471,7 +579,9 @@ Results can include `transactionId` and `reason`. Ingestion does not require pri
 ```json
 {
   "publicKey": "<PEM-encoded RSA public key>",
-  "algorithm": "RSA-OAEP-SHA256 + AES-256-GCM"
+  "algorithm": "RSA-OAEP-SHA256 + AES-256-GCM",
+  "signingAlgorithm": "Ed25519",
+  "packetVersion": 1
 }
 ```
 
@@ -507,12 +617,17 @@ meshpay/
 ├── web/
 │   ├── components/dashboard.tsx     # Client interface
 │   ├── lib/types.ts                 # Shared contracts
+│   ├── lib/protocol.ts              # Schemas and canonical signing data
+│   ├── lib/wallet.ts                # Browser wallet import/signing
 │   └── server/
 │       ├── crypto.ts                # Encryption and hashing
 │       └── engine.ts                # Mesh and SQLite settlement
 ├── tests/
 │   ├── api.test.ts                  # Origin and validation tests
 │   └── engine.test.ts               # Crypto, routing, persistence
+├── tests/concurrency.test.ts         # Independent SQLite writers
+├── tests/helpers/                   # Signing fixtures and process entry
+├── scripts/create-wallets.ts         # Trusted local provisioning
 ├── screenshots/                     # Dashboard images
 ├── AGENTS.md                        # Agent guidance
 ├── next.config.ts                   # Framework configuration
@@ -538,7 +653,7 @@ Generated local directories are `.next/`, `node_modules/`, and `.data/`. The `@/
 | `npm test`          | Run `tests/*.test.ts` via `tsx` and Node test runner |
 | `npm run format`    | Format configured sources and configuration          |
 
-The format script includes `TYPESCRIPT.md` but excludes `README.md`.
+`npm run wallets:create` provisions keys and local wallet files. The format script includes `scripts/` and `TYPESCRIPT.md` but excludes `README.md`.
 
 ### Verification
 
@@ -548,7 +663,7 @@ npm test
 npm run build
 ```
 
-The current suite contains 12 tests covering:
+The suite covers the original payment flow and the new security and recovery behavior:
 
 - Encryption round trip and tamper detection.
 - Two-hop delivery to both bridges and one settlement.
@@ -563,7 +678,9 @@ The current suite contains 12 tests covering:
 - Same-origin loopback requests reaching amount validation.
 - Malformed and cross-origin Origin rejection.
 
-Most engine tests use in-memory SQLite; persistence uses a temporary disk database. The asynchronous delivery test runs synchronous engine operations in one Node process. It is not a multi-process concurrency or load test.
+Additional tests cover wrong-key forgery, unsigned legacy rejection, packet ID/TTL/proof tampering, key mismatch, browser WebCrypto interoperability, registration persistence, and all four failure modes with deterministic recovery. Most engine tests use in-memory SQLite; persistence uses a temporary disk database.
+
+Two concurrency cases launch **six independent Node processes** against one temporary SQLite file. After readiness, the parent holds a write lock, releases their ingestion barrier, and then releases the lock. Each asserts one settlement, five duplicates sharing one transaction ID, one ledger row, one debit/credit, and conserved balances. Cases cover identical ciphertext and different ciphertexts sharing a sender nonce. These exercise real SQLite writer contention through independent engines rather than one synchronous HTTP server, and are not production load tests.
 
 Browser end-to-end tests, full HTTP integration coverage for every route, and deployment/load tests are not included.
 
@@ -574,6 +691,8 @@ For Next.js changes, follow `AGENTS.md` and consult the version-specific guides 
 ### Implemented safeguards
 
 - AES-GCM detects encrypted payload modification.
+- Ed25519 verifies all instruction fields and packet identity against registered sender public keys.
+- Signed maximum TTL and hop root authenticate the current decrementable hop budget.
 - RSA-OAEP wraps a fresh AES key for each packet.
 - Schema validation checks amounts, payloads, and UUID nonces.
 - Timestamp bounds limit acceptance of old and far-future instructions.
@@ -583,17 +702,31 @@ For Next.js changes, follow `AGENTS.md` and consult the version-specific guides 
 
 ### Boundaries
 
-- Senders are unauthenticated and instructions carry no sender signature.
-- Anyone with API access can issue instructions for demo accounts. The public key also lets clients encrypt instructions naming those accounts.
+- Sender key possession is verified, but real-world identity enrollment and authenticated sessions are absent.
+- Anyone with API access can inspect queues, reset/configure the mesh, or trigger delivery of an already authorized payment. They cannot forge a new sender authorization without the signing key.
 - Bridges are unauthenticated; labels are caller-provided metadata.
 - No physical Bluetooth, peer discovery, mobile wallet, or offline browser application is implemented. The browser still needs access to the server.
 - There is no UPI PIN collection, bank integration, or real-money settlement.
 - The RSA private key is stored unencrypted in SQLite for demo convenience.
-- Packet ID and TTL are not cryptographically bound to the instruction.
+- Demo signing keys are unencrypted local wallet fixtures generated on the development machine. Protect them and distribute only to their intended sender.
+- Earlier higher-TTL copies can be replayed; there is no authenticated route history.
 - Queues lack durable storage, automatic expiry, acknowledgements, and capacity limits.
-- Rate limiting, user-specific authorization, key rotation, operational monitoring, and migrations are not implemented.
+- Rate limiting, session access control, key rotation/revocation, operational monitoring, and migrations are not implemented.
 
 This is **mesh-routed deferred settlement**. Queueing an instruction is not a guaranteed or final offline funds transfer.
+
+## Threat model
+
+Trust boundaries: senders hold signing keys; a trusted local administrator registers public keys; relays and bridges are untrusted; the settlement server and database are trusted. The model assumes wallets and trusted components are not compromised.
+
+| Threat                                             | Mitigation                                                                                         | Remaining gap                                                                                                                                |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Forgery: create/alter a payment for another sender | Domain-separated Ed25519 signatures checked against registered keys before queueing and settlement | Stolen fixtures, XSS while a wallet is imported, or administrator/server compromise defeat this boundary; real identity enrollment is absent |
+| Replay: resend or re-encrypt an instruction        | Persistent ciphertext hash and sender/nonce uniqueness in a transaction; timestamp window          | Signers can authorize new nonces; transport copies and delivery timing remain replayable                                                     |
+| Relay tampering: alter payload, packet ID, or TTL  | AES-GCM, signed instruction/ID/max TTL/root, and current hop proof                                 | Drop packets, consume TTL, or replay an earlier retained higher-TTL copy; no route provenance, and state exposes earlier proofs              |
+| Malicious bridge: forge, duplicate, delay, relabel | Independent signature/metadata checks and durable deduplication                                    | No bridge authentication/provenance; withholding, reordering, false labels, and denial of service remain possible                            |
+
+Failure simulations demonstrate recovery after connectivity heals, not guaranteed liveness against permanent adversarial dropping or delays past the accepted timestamp window.
 
 ## Deployment considerations
 
@@ -613,6 +746,8 @@ The intended environment is a local sandbox with one server process and persiste
 Static-only export cannot serve the required APIs and database. No hosted deployment configuration or multi-instance coordination layer is supplied.
 
 ## Troubleshooting
+
+For signing errors, run `npm run wallets:create`, import the matching wallet JSON, and use localhost/HTTPS with WebCrypto Ed25519 support. Restore an original wallet if its key is already registered; automatic replacement is disabled. Existing delayed copies retain their due rounds after network recovery, so continue gossip.
 
 | Symptom                                      | Explanation or next step                                                                    |
 | -------------------------------------------- | ------------------------------------------------------------------------------------------- |
@@ -634,11 +769,11 @@ To restore the original seed state, stop the server and use a fresh database. Ba
 
 These are extension ideas, not implemented features:
 
-- Authenticate users and verify sender signatures.
+- Add real account enrollment and authenticated sessions around the implemented sender signatures.
 - Introduce real peer transport and authenticated device identities.
 - Persist queues with acknowledgements, retries, expiry, and limits.
 - Protect key custody and define rotation procedures.
 - Add ledger pagination, all-time metrics, and transaction inspection.
-- Add browser end-to-end, broader API, and multi-process tests.
+- Add browser end-to-end, hosted deployment, and broader API/load tests.
 - Define migrations, backups, monitoring, and deployment operations.
 - Design payment-provider integration and authorization separately from this simulator.
