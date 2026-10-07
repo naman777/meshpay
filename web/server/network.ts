@@ -330,20 +330,23 @@ export class MeshNetwork {
     });
   }
   static restore(snapshot: NetworkSnapshot): MeshNetwork {
+    const network = new MeshNetwork();
+    network.restoreSnapshot(snapshot);
+    return network;
+  }
+  protected restoreSnapshot(snapshot: NetworkSnapshot) {
     if (snapshot.version !== 1)
       throw new Error("Unsupported persisted mesh state version");
-    const network = new MeshNetwork();
     const value = structuredClone(snapshot);
-    network.devices = value.devices;
-    network.events = value.events;
-    network.rounds = value.rounds;
-    network.duplicates = value.duplicates;
-    network.transfers = value.transfers;
-    network.failures = value.failures;
-    network.randomState = value.randomState;
-    network.dropped = value.dropped;
-    network.delayed = value.delayed;
-    network.sent = new Map(value.sent);
-    return network;
+    this.devices = value.devices;
+    this.events = value.events;
+    this.rounds = value.rounds;
+    this.duplicates = value.duplicates;
+    this.transfers = value.transfers;
+    this.failures = value.failures;
+    this.randomState = value.randomState;
+    this.dropped = value.dropped;
+    this.delayed = value.delayed;
+    this.sent = new Map(value.sent);
   }
 }

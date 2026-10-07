@@ -7,6 +7,33 @@ export type BrowserWallet = {
   publicKey: string;
   key: CryptoKey;
 };
+export const DEMO_SENDERS = [
+  "alice@demo",
+  "bob@demo",
+  "carol@demo",
+  "dave@demo",
+] as const;
+export async function createDemoWallets(): Promise<
+  Record<string, BrowserWallet>
+> {
+  if (!globalThis.crypto?.subtle)
+    throw new Error(
+      "Open MeshPay over HTTPS in a current browser to start the demo.",
+    );
+  const wallets: Record<string, BrowserWallet> = {};
+  for (const sender of DEMO_SENDERS) {
+    const pair = await crypto.subtle.generateKey("Ed25519", false, [
+      "sign",
+      "verify",
+    ]);
+    const encoded = base64(
+      await crypto.subtle.exportKey("spki", pair.publicKey),
+    );
+    const publicKey = `-----BEGIN PUBLIC KEY-----\n${encoded.match(/.{1,64}/g)!.join("\n")}\n-----END PUBLIC KEY-----\n`;
+    wallets[sender] = { sender, publicKey, key: pair.privateKey };
+  }
+  return wallets;
+}
 const walletSchema = z.strictObject({
   version: z.literal(1),
   sender: z.string().min(1),

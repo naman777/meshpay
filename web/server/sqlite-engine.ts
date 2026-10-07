@@ -25,11 +25,19 @@ import type {
 } from "../lib/types";
 
 export { DEFAULT_FAILURES } from "./network";
-import { MeshNetwork, SEED_ACCOUNTS } from "./network";
+import { MeshNetwork, SEED_ACCOUNTS, type NetworkSnapshot } from "./network";
+export type SandboxSnapshot = {
+  version: 1;
+  network: NetworkSnapshot;
+  keys: { publicKey: string; privateKey: string };
+  accounts: Account[];
+  signingKeys: { sender: string; publicKey: string }[];
+  ledger: (LedgerEntry & { nonce: string })[];
+};
 export class MeshEngine extends MeshNetwork {
   private db: DatabaseSync;
   private keys: { publicKey: string; privateKey: string };
-  constructor(path: string) {
+  constructor(path: string, keys?: { publicKey: string; privateKey: string }) {
     super();
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL;");
@@ -43,7 +51,9 @@ export class MeshEngine extends MeshNetwork {
       const existing = this.db
         .prepare("SELECT publicKey, privateKey FROM keys WHERE id=1")
         .get();
-      this.keys = existing ? (existing as typeof this.keys) : generateKeys();
+      this.keys = existing
+        ? (existing as typeof this.keys)
+        : (keys ?? generateKeys());
       if (!existing)
         this.db
           .prepare("INSERT INTO keys VALUES (1, ?, ?)")
@@ -263,6 +273,70 @@ export class MeshEngine extends MeshNetwork {
   }
   getPublicKey() {
     return this.keys.publicKey;
+  }
+  exportSandbox(): SandboxSnapshot {
+    return {
+      version: 1,
+      network: this.snapshot(),
+      keys: { ...this.keys },
+      accounts: this.db
+        .prepare("SELECT * FROM accounts ORDER BY rowid")
+        .all() as Account[],
+      signingKeys: this.db
+        .prepare("SELECT * FROM signing_keys")
+        .all() as SandboxSnapshot["signingKeys"],
+      ledger: this.db
+        .prepare("SELECT * FROM ledger ORDER BY rowid")
+        .all() as SandboxSnapshot["ledger"],
+    };
+  }
+  static importSandbox(value: SandboxSnapshot) {
+    if (value.version !== 1)
+      throw new Error("Unsupported sandbox state version");
+    const engine = new MeshEngine(":memory:", value.keys);
+    try {
+      for (const a of value.accounts)
+        engine.db
+          .prepare("UPDATE accounts SET balance=? WHERE vpa=?")
+          .run(a.balance, a.vpa);
+      for (const k of value.signingKeys)
+        engine.registerPublicKey(k.sender, k.publicKey);
+      for (const t of value.ledger)
+        engine.db
+          .prepare("INSERT INTO ledger VALUES (?,?,?,?,?,?,?,?,?,?)")
+          .run(
+            t.id,
+            t.sender,
+            t.receiver,
+            t.amount,
+            t.status,
+            t.createdAt,
+            t.bridge,
+            t.hash,
+            t.nonce,
+            t.reason,
+          );
+      engine.restoreSnapshot(value.network);
+      return engine;
+    } catch (error) {
+      engine.close();
+      throw error;
+    }
+  }
+  resetSandbox() {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.exec("DELETE FROM ledger");
+      for (const a of SEED_ACCOUNTS)
+        this.db
+          .prepare("UPDATE accounts SET balance=? WHERE vpa=?")
+          .run(a.balance, a.vpa);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+    this.resetMesh();
   }
   close() {
     this.db.close();
