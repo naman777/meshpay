@@ -25,6 +25,8 @@
   color: var(--muted);
 }
 .wallet-import span {
+  display: block;
+  margin-bottom: 12px;
   font-size: 11px;
   color: var(--green);
 }

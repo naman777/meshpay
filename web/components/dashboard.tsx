@@ -1,5 +1,5 @@
 "use client";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Activity,
   ArrowDownLeft,
@@ -23,11 +23,9 @@ import {
   X,
 } from "lucide-react";
 import type { State, FailureConfig } from "../lib/types";
-import {
-  createSignedSend,
-  importWallet,
-  type BrowserWallet,
-} from "../lib/wallet";
+import { createSignedSend, type BrowserWallet } from "../lib/wallet";
+
+import { startSandbox } from "../lib/sandbox";
 
 const money = (paise: number) =>
   new Intl.NumberFormat("en-IN", {
@@ -52,6 +50,11 @@ export default function Dashboard() {
   const [selected, setSelected] = useState("alice");
   const [help, setHelp] = useState(false);
   const [section, setSection] = useState("Overview");
+  const [session, setSession] = useState<string | null>(null);
+  const [preparing, setPreparing] = useState(true);
+  const bootstrap = useRef<ReturnType<typeof startSandbox> | null>(null);
+  const pendingAction = useRef(false);
+  const stateVersion = useRef(0);
   const [wallets, setWallets] = useState<Record<string, BrowserWallet>>({});
   useEffect(() => {
     if (!help) return;
@@ -82,24 +85,69 @@ export default function Dashboard() {
       previous?.focus();
     };
   }, [help]);
-  const refresh = useCallback(async (signal?: AbortSignal) => {
+  const initialize = useCallback(async (signal?: AbortSignal) => {
+    stateVersion.current++;
+    setPreparing(true);
+    setError("");
+    setState(null);
+    setSession(null);
     try {
-      const response = await fetch("/api/state", { cache: "no-store", signal });
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(data.error || "Could not connect to the simulator");
-      }
-      setState(await response.json());
-      setError((previous) =>
-        previous.startsWith("Connection interrupted") ? "" : previous,
-      );
-    } catch (e) {
-      if (!(e instanceof Error && e.name === "AbortError"))
+      bootstrap.current ??= startSandbox();
+      const demo = await bootstrap.current;
+      if (signal?.aborted) return;
+      setWallets(demo.wallets);
+      setState(demo.state);
+      setSession(demo.session);
+    } catch (error) {
+      bootstrap.current = null;
+      if (!signal?.aborted)
         setError(
-          `Connection interrupted. ${e instanceof Error ? e.message : "Retrying automatically…"}`,
+          error instanceof Error
+            ? error.message
+            : "Could not start your demo. Try again.",
         );
+    } finally {
+      if (!signal?.aborted) setPreparing(false);
     }
   }, []);
+  useEffect(() => {
+    const controller = new AbortController();
+    void initialize(controller.signal);
+    return () => controller.abort();
+  }, [initialize]);
+  const refresh = useCallback(
+    async (signal?: AbortSignal) => {
+      if (!session || pendingAction.current) return;
+      const version = stateVersion.current;
+      try {
+        const response = await fetch("/api/sandbox", {
+          cache: "no-store",
+          signal,
+          headers: { "X-MeshPay-Session": session },
+        });
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          if (response.status === 410) {
+            setSession(null);
+            setState(null);
+          }
+          throw new Error(data.error || "Could not connect to the simulator");
+        }
+        const data = await response.json();
+        if (signal?.aborted || version !== stateVersion.current) return;
+        setState(data);
+        setError((previous) =>
+          previous.startsWith("Connection interrupted") ? "" : previous,
+        );
+      } catch (e) {
+        if (!(e instanceof Error && e.name === "AbortError"))
+          setError(
+            `Connection interrupted. ${e instanceof Error ? e.message : "Retrying automatically…"}`,
+          );
+      }
+    },
+    [session],
+  );
   useEffect(() => {
     const controller = new AbortController();
     void refresh(controller.signal);
@@ -110,7 +158,9 @@ export default function Dashboard() {
     };
   }, [refresh]);
   async function act(action: string, extra: Record<string, unknown> = {}) {
-    if (busy) return;
+    if (pendingAction.current || busy || preparing || !session) return;
+    pendingAction.current = true;
+    stateVersion.current++;
     setBusy(true);
     setError("");
     try {
@@ -120,14 +170,14 @@ export default function Dashboard() {
         const wallet = wallets[account];
         if (!wallet)
           throw new Error(
-            `Import the wallet for ${account} before signing a payment`,
+            `Your demo is still preparing. Please try again in a moment.`,
           );
         if (
           state?.accounts.find((a) => a.vpa === account)?.signingPublicKey !==
           wallet.publicKey
         )
           throw new Error(
-            "Wallet key is not registered for this account. Run the local provisioning command and refresh.",
+            "Your demo signing key is out of sync. Start a fresh demo.",
           );
         payload = {
           action,
@@ -138,39 +188,28 @@ export default function Dashboard() {
           )),
         };
       }
-      const response = await fetch("/api/actions", {
+      const response = await fetch("/api/sandbox", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-MeshPay-Session": session,
+        },
         body: JSON.stringify(payload),
       });
       const data = await response.json();
-      if (!response.ok) throw new Error(data.error);
+      if (!response.ok) {
+        if (response.status === 410) {
+          setSession(null);
+          setState(null);
+        }
+        throw new Error(data.error);
+      }
       setState(data);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something went wrong");
     } finally {
+      pendingAction.current = false;
       setBusy(false);
-    }
-  }
-  async function loadWallets(files: File[]) {
-    setError("");
-    try {
-      const imported: Record<string, BrowserWallet> = {};
-      for (const file of files) {
-        if (file.size > 8192) throw new Error("Wallet file is too large");
-        const wallet = await importWallet(JSON.parse(await file.text()));
-        if (
-          state?.accounts.find((a) => a.vpa === wallet.sender)
-            ?.signingPublicKey !== wallet.publicKey
-        )
-          throw new Error(
-            `Public key for ${wallet.sender} is not registered or does not match this wallet`,
-          );
-        imported[wallet.sender] = wallet;
-      }
-      setWallets((previous) => ({ ...previous, ...imported }));
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not import wallet");
     }
   }
   function configure(patch: Partial<FailureConfig>) {
@@ -243,7 +282,7 @@ export default function Dashboard() {
         </div>
         <div className="sidebar-bottom">
           <span className="environment-dot" />
-          Local demo environment
+          Your demo environment
           <button aria-label="About this demo" onClick={() => setHelp(true)}>
             <CircleHelp size={17} />
           </button>
@@ -283,7 +322,8 @@ export default function Dashboard() {
                 Payments beyond connectivity<span>.</span>
               </h1>
               <p>
-                Watch encrypted payments find their way. One device at a time.
+                Click Run live demo to watch a signed payment settle. No setup
+                needed.
               </p>
             </div>
             <button
@@ -292,7 +332,11 @@ export default function Dashboard() {
               onClick={() => void act("demo")}
             >
               <Play size={15} fill="currentColor" />
-              {busy ? "Working…" : "Run live demo"}
+              {preparing
+                ? "Preparing demo…"
+                : busy
+                  ? "Working…"
+                  : "Run live demo"}
               <ArrowUpRight size={16} />
             </button>
           </div>
@@ -311,7 +355,17 @@ export default function Dashboard() {
           </div>
           {error && (
             <div className="error-banner" role="alert">
-              {error}
+              <span>{error}</span>
+              {!session && !preparing && (
+                <button
+                  onClick={() => {
+                    bootstrap.current = null;
+                    void initialize();
+                  }}
+                >
+                  Try again
+                </button>
+              )}
               <button onClick={() => setError("")} aria-label="Dismiss error">
                 <X size={16} />
               </button>
@@ -367,8 +421,8 @@ export default function Dashboard() {
                 </div>
                 <button
                   className="icon-button"
-                  title="Clear mesh packets; keep balances and ledger"
-                  aria-label="Reset mesh"
+                  title="Start fresh with original demo balances"
+                  aria-label="Start fresh sandbox"
                   disabled={busy}
                   onClick={() => void act("reset")}
                 >
@@ -594,29 +648,25 @@ export default function Dashboard() {
                 }}
               >
                 <div className="wallet-import">
-                  <label htmlFor="wallet-files">Sender wallets</label>
-                  <input
-                    id="wallet-files"
-                    type="file"
-                    accept=".json,application/json"
-                    multiple
-                    disabled={!state || busy}
-                    onChange={(e) => {
-                      const files = Array.from(e.target.files ?? []);
-                      e.target.value = "";
-                      void loadWallets(files);
-                    }}
-                  />
+                  <strong>No setup needed</strong>
                   <p>
-                    Import a demo wallet generated with{" "}
-                    <code>npm run wallets:create</code>. Private keys stay in
-                    this browser tab.
+                    Your demo accounts are ready. Click Run live demo, or choose
+                    an amount below. Signing happens automatically in this
+                    browser.
                   </p>
                   <span role="status">
-                    {wallets[sender]
-                      ? `Signing ready for ${sender}`
-                      : `No wallet loaded for ${sender}`}
+                    {preparing
+                      ? "Preparing your sandbox…"
+                      : "Your own sandbox · demo balances only"}
                   </span>
+                  <button
+                    type="button"
+                    className="button light"
+                    disabled={busy || preparing || !state}
+                    onClick={() => void act("reset")}
+                  >
+                    Start fresh
+                  </button>
                 </div>
                 <label htmlFor="sender">From account</label>
                 <div className="select-wrap">
@@ -1050,15 +1100,15 @@ export default function Dashboard() {
             </span>
             <h2 id="help-title">A payment’s journey</h2>
             <p>
-              This is a local simulator of mesh-routed deferred payments, with a
-              persistent demo ledger.
+              This is an interactive simulator of mesh-routed deferred payments,
+              with a persistent demo ledger.
             </p>
             <ol>
               <li>
                 <strong>Compose & encrypt</strong>
                 <span>
-                  Import a sender wallet, then choose an amount. Your browser
-                  signs the instruction; the server verifies and encrypts it.
+                  Choose an amount or run the one-click demo. Your browser signs
+                  the instruction; the server verifies and encrypts it.
                 </span>
               </li>
               <li>
@@ -1077,11 +1127,12 @@ export default function Dashboard() {
               </li>
             </ol>
             <p className="help-note">
-              Reset mesh clears packets and session counters; it keeps balances
-              and transactions. Run live demo transfers ₹500 from Alice to Bob
-              each time using Alice's imported wallet. Ed25519 verifies
-              possession of the registered key; physical Bluetooth and real
-              account enrollment remain outside this demo.
+              Start fresh restores demo balances and clears packets, failures,
+              and transactions in your own sandbox. Run live demo starts fresh
+              and transfers ₹500 from Alice to Bob using automatically prepared
+              browser keys. Ed25519 verifies possession of the registered key;
+              physical Bluetooth and real account enrollment remain outside this
+              demo.
             </p>
             <button className="button dark" onClick={() => setHelp(false)}>
               Let’s explore <ArrowRight size={16} />
